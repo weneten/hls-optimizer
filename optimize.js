@@ -189,6 +189,7 @@ async function main() {
   const {
     file_id,
     user_id,
+    source_release_id,
     release_id,
     owner,
     repo,
@@ -205,30 +206,40 @@ async function main() {
   fs.mkdirSync(WORK_DIR, { recursive: true });
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
-  // 2. Fetch Release Assets info
-  const releaseUrl = `https://api.github.com/repos/${owner}/${repo}/releases/${release_id}`;
-  console.log(`Fetching release info from: ${releaseUrl}`);
-  const releaseRes = await apiRequest(releaseUrl, 'GET', {
+  // 2. Fetch Source Release Assets info
+  const sourceReleaseId = source_release_id || release_id; // Fallback if source_release_id is not provided
+  const sourceReleaseUrl = `https://api.github.com/repos/${owner}/${repo}/releases/${sourceReleaseId}`;
+  console.log(`Fetching source release info from: ${sourceReleaseUrl}`);
+  const sourceReleaseRes = await apiRequest(sourceReleaseUrl, 'GET', {
     'Authorization': `Bearer ${token}`,
     'Accept': 'application/vnd.github+json',
   });
-  const releaseInfo = JSON.parse(releaseRes.body.toString('utf8'));
-  const uploadUrl = releaseInfo.upload_url;
+  const sourceReleaseInfo = JSON.parse(sourceReleaseRes.body.toString('utf8'));
 
-  // Filter out and sort the split parts
-  let partAssets = releaseInfo.assets
+  // 2b. Fetch Target Release info for uploads
+  const targetReleaseUrl = `https://api.github.com/repos/${owner}/${repo}/releases/${release_id}`;
+  console.log(`Fetching target release info from: ${targetReleaseUrl}`);
+  const targetReleaseRes = await apiRequest(targetReleaseUrl, 'GET', {
+    'Authorization': `Bearer ${token}`,
+    'Accept': 'application/vnd.github+json',
+  });
+  const targetReleaseInfo = JSON.parse(targetReleaseRes.body.toString('utf8'));
+  const uploadUrl = targetReleaseInfo.upload_url;
+
+  // Filter out and sort the split parts from the source release
+  let partAssets = sourceReleaseInfo.assets
     .filter(a => a.name.includes('.part'))
     .sort((a, b) => a.name.localeCompare(b.name));
 
   if (partAssets.length === 0) {
     // Fallback for non-chunked source video uploads (e.g., single mp4/mkv files)
-    partAssets = releaseInfo.assets
+    partAssets = sourceReleaseInfo.assets
       .filter(a => !a.name.endsWith('.zip') && !a.name.endsWith('.m3u8') && !a.name.endsWith('.vtt') && !a.name.endsWith('.json'))
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
   if (partAssets.length === 0) {
-    console.error('Error: No source files found in the release.');
+    console.error(`Error: No source files found in the source release (${sourceReleaseId}).`);
     process.exit(1);
   }
 
