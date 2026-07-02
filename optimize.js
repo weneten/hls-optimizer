@@ -196,9 +196,13 @@ async function main() {
     label,
     kind,
     target_height,
-    vps_callback_url,
-    vps_callback_token
+    vps,
+    vps_callback_url: flat_vps_callback_url,
+    vps_callback_token: flat_vps_callback_token
   } = payload;
+
+  const vps_callback_url = vps ? vps.callback_url : flat_vps_callback_url;
+  const vps_callback_token = vps ? vps.callback_token : flat_vps_callback_token;
 
   console.log(`Starting HLS Optimization Job for file: ${file_id} (Release: ${release_id}, Label: ${label}, Kind: ${kind})`);
 
