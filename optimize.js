@@ -270,8 +270,8 @@ async function main() {
 
   // 5. Probe video stream properties
   console.log('Probing video stream properties...');
-  const probeCmd = `ffprobe -v error -show_entries format=duration -show_entries stream=index,codec_type,codec_name,width,height:tags=language,title -of json "${INPUT_FILE}"`;
-  const probeData = JSON.parse(execSync(probeCmd).toString());
+  const probeCmd = `ffprobe -v error -show_entries "format=duration:stream=index,codec_type,codec_name,width,height:tags=language,title" -of json "${INPUT_FILE}"`;
+  const probeData = JSON.parse(execSync(probeCmd, { maxBuffer: 100 * 1024 * 1024 }).toString());
 
   const videoStream = probeData.streams.find(s => s.codec_type === 'video');
   if (!videoStream) {
@@ -419,7 +419,7 @@ async function main() {
     console.log(`Packaging ZIP ${zipName} with ${pendingFiles.length} segments...`);
     const fileArgs = pendingFiles.map(f => `"${f.fullPath}"`).join(' ');
     // Use system zip utility with compression level 0 (store only) for maximum speed
-    execSync(`zip -0 -j "${zipPath}" ${fileArgs}`);
+    execSync(`zip -0 -j "${zipPath}" ${fileArgs}`, { stdio: 'ignore' });
     
     const zipSize = fs.statSync(zipPath).size;
     console.log(`Uploading ${zipName} (${(zipSize / 1024 / 1024).toFixed(1)} MB)...`);
