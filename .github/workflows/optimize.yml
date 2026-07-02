@@ -1,4 +1,4 @@
-name: HLS Video Optimizer (Local Self-Hosted)
+name: HLS Video Optimizer
 
 on:
   repository_dispatch:
@@ -6,10 +6,8 @@ on:
 
 jobs:
   optimize:
-    name: Process HLS Video (Local)
-    runs-on: self-hosted
-    container:
-      image: node:20-bookworm
+    name: Process HLS Video
+    runs-on: ubuntu-latest
     
     # Restrict runner permissions to minimum
     permissions:
@@ -19,10 +17,15 @@ jobs:
       - name: Checkout worker repository
         uses: actions/checkout@v4
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
       - name: Install System Dependencies
         run: |
-          apt-get update
-          apt-get install -y ffmpeg zip
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg zip
 
       - name: Run HLS Optimizer
         env:
