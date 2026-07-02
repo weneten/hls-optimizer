@@ -337,7 +337,7 @@ async function main() {
       '-vf', `"scale='trunc(oh*a/2)*2':'trunc(min(${tHeight},ih)/2)*2'"`,
       '-c:a', 'aac',
       '-b:a', '192k',
-      '-force_key_frames', 'expr:gte(t,n_forced*6)'
+      '-force_key_frames', '"expr:gte(t,n_forced*6)"'
     );
   }
 
