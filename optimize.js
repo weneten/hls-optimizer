@@ -216,12 +216,19 @@ async function main() {
   const uploadUrl = releaseInfo.upload_url;
 
   // Filter out and sort the split parts
-  const partAssets = releaseInfo.assets
+  let partAssets = releaseInfo.assets
     .filter(a => a.name.includes('.part'))
     .sort((a, b) => a.name.localeCompare(b.name));
 
   if (partAssets.length === 0) {
-    console.error('Error: No part files found in the source release.');
+    // Fallback for non-chunked source video uploads (e.g., single mp4/mkv files)
+    partAssets = releaseInfo.assets
+      .filter(a => !a.name.endsWith('.zip') && !a.name.endsWith('.m3u8') && !a.name.endsWith('.vtt') && !a.name.endsWith('.json'))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  if (partAssets.length === 0) {
+    console.error('Error: No source files found in the release.');
     process.exit(1);
   }
 
