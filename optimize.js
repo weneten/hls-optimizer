@@ -284,6 +284,14 @@ async function main() {
   const inferredHeight = videoStream.height || null;
   const inferredCodec = kind === 'original' ? (videoStream.codec_name || 'copy') : 'h264';
 
+  let outputWidth = inferredWidth;
+  let outputHeight = inferredHeight;
+  if (kind === 'compressed' && inferredWidth && inferredHeight) {
+    const targetHeight = target_height || 1080;
+    outputHeight = Math.min(targetHeight, inferredHeight);
+    outputWidth = Math.round((outputHeight * inferredWidth) / inferredHeight / 2) * 2;
+  }
+
   const audioStream = probeData.streams.find(s => s.codec_type === 'audio');
   const hasAacAudio = audioStream && audioStream.codec_name?.toLowerCase() === 'aac';
 
@@ -510,8 +518,8 @@ async function main() {
     userId: user_id,
     label,
     kind,
-    width: inferredWidth,
-    height: inferredHeight,
+    width: outputWidth,
+    height: outputHeight,
     codec: inferredCodec,
     githubReleaseId: release_id,
     playlistText: rewrittenMainPlaylist,
