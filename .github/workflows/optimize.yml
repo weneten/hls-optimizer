@@ -1,0 +1,35 @@
+name: HLS Video Optimizer
+
+on:
+  repository_dispatch:
+    types: [optimize-hls]
+
+jobs:
+  optimize:
+    name: Process HLS Video
+    runs-on: ubuntu-latest
+    
+    # Restrict runner permissions to minimum
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout worker repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg zip
+
+      - name: Run HLS Optimizer
+        env:
+          EVENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          node optimize.js
