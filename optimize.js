@@ -203,8 +203,10 @@ async function main() {
 
   const vps_callback_url = vps ? vps.callback_url : flat_vps_callback_url;
   const vps_callback_token = vps ? vps.callback_token : flat_vps_callback_token;
+  const hls_preset = (vps && vps.preset) ? vps.preset : 'veryfast';
+  const hls_crf = (vps && vps.crf !== undefined) ? String(vps.crf) : '20';
 
-  console.log(`Starting HLS Optimization Job for file: ${file_id} (Release: ${release_id}, Label: ${label}, Kind: ${kind})`);
+  console.log(`Starting HLS Optimization Job for file: ${file_id} (Release: ${release_id}, Label: ${label}, Kind: ${kind}, Preset: ${hls_preset}, CRF: ${hls_crf})`);
 
   // 1. Prepare directories
   fs.mkdirSync(WORK_DIR, { recursive: true });
@@ -270,7 +272,7 @@ async function main() {
 
   // 5. Probe video stream properties
   console.log('Probing video stream properties...');
-  const probeCmd = `ffprobe -v error -show_entries "format=duration:stream=index,codec_type,codec_name,width,height:tags=language,title" -of json "${INPUT_FILE}"`;
+  const probeCmd = `ffprobe -v error -show_entries "format=duration:stream=index,codec_type,codec_name,width,height:stream_tags=language,title" -of json "${INPUT_FILE}"`;
   const probeData = JSON.parse(execSync(probeCmd, { maxBuffer: 100 * 1024 * 1024 }).toString());
 
   const videoStream = probeData.streams.find(s => s.codec_type === 'video');
@@ -332,8 +334,8 @@ async function main() {
     const tHeight = target_height || 1080;
     ffmpegArgs.push(
       '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-crf', '20',
+      '-preset', hls_preset,
+      '-crf', hls_crf,
       '-vf', `"scale='trunc(oh*a/2)*2':'trunc(min(${tHeight},ih)/2)*2'"`,
       '-c:a', 'aac',
       '-b:a', '192k',
@@ -355,7 +357,7 @@ async function main() {
       const subPlaylistPath = path.join(OUTPUT_DIR, `subtitle_${sub.index}.m3u8`);
       const subSegmentPattern = path.join(OUTPUT_DIR, `subtitle_${sub.index}_%05d.vtt`);
       
-      const subFfmpegCmd = `ffmpeg -y -i "${INPUT_FILE}" -vn -an -f hls -hls_time 4 -hls_playlist_type vod -hls_segment_filename "${subSegmentPattern}" -hls_flags independent_segments -map 0:${sub.index} -c:s webvtt "${subPlaylistPath}"`;
+      const subFfmpegCmd = `ffmpeg -y -i "${INPUT_FILE}" -vn -an -map 0:${sub.index} -c:s webvtt -f segment -segment_time 4 -segment_list_type m3u8 -segment_list "${subPlaylistPath}" "${subSegmentPattern}"`;
       console.log(`Executing Subtitle FFmpeg command: ${subFfmpegCmd}`);
       
       try {
