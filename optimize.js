@@ -319,7 +319,7 @@ async function main() {
             index: s.index,
             codec,
             language: getStreamTag(s, 'language'),
-            title: getStreamTag(s, 'title')
+            title: getStreamTag(s, 'title') || getStreamTag(s, 'handler_name') || getStreamTag(s, 'name')
           });
         }
       } else if (s.codec_type === 'audio') {
@@ -327,7 +327,7 @@ async function main() {
           index: s.index,
           codec: s.codec_name?.toLowerCase(),
           language: getStreamTag(s, 'language'),
-          title: getStreamTag(s, 'title')
+          title: getStreamTag(s, 'title') || getStreamTag(s, 'handler_name') || getStreamTag(s, 'name')
         });
       }
     });
@@ -588,6 +588,27 @@ async function main() {
   await uploadAssetFile(uploadUrl, 'playlist.m3u8', mainPlaylistTmpPath, 'application/vnd.apple.mpegurl', token);
   fs.unlinkSync(mainPlaylistTmpPath);
 
+  const callbackAudios = [];
+  if (audioStreams.length > 0) {
+    // Default audio track (muxed)
+    callbackAudios.push({
+      streamIndex: audioStreams[0].index,
+      language: audioStreams[0].language,
+      title: audioStreams[0].title,
+      isDefault: true
+    });
+    
+    // Add rewritten alternative audio tracks
+    for (const aud of rewrittenAudioPlaylists) {
+      callbackAudios.push({
+        streamIndex: aud.streamIndex,
+        language: aud.language,
+        title: aud.title,
+        isDefault: false
+      });
+    }
+  }
+
   // 10. Callback to VPS to notify completeness
   console.log(`Sending success callback to VPS at: ${vps_callback_url}`);
   const callbackBody = {
@@ -602,7 +623,7 @@ async function main() {
     playlistText: rewrittenMainPlaylist,
     completedZips,
     subtitles: rewrittenSubtitlePlaylists,
-    audios: rewrittenAudioPlaylists,
+    audios: callbackAudios,
     token: vps_callback_token
   };
 
