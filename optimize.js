@@ -4,6 +4,17 @@ const { execSync } = require('child_process');
 const https = require('https');
 const { URL } = require('url');
 
+function getStreamTag(stream, tagName) {
+  if (!stream || !stream.tags) return undefined;
+  const targetLower = tagName.toLowerCase();
+  for (const key of Object.keys(stream.tags)) {
+    if (key.toLowerCase() === targetLower) {
+      return stream.tags[key];
+    }
+  }
+  return undefined;
+}
+
 // Config and constants
 const WORK_DIR = '/tmp/hls-worker';
 const INPUT_FILE = path.join(WORK_DIR, 'input.mp4');
@@ -298,6 +309,7 @@ async function main() {
   // Find text subtitle streams that FFmpeg can parse to webvtt
   const textSubtitleCodecs = new Set(['ass', 'ssa', 'srt', 'subrip', 'webvtt', 'mov_text', 'text']);
   const subtitleStreams = [];
+  const audioStreams = [];
   if (kind === 'original') {
     probeData.streams.forEach(s => {
       if (s.codec_type === 'subtitle') {
@@ -306,10 +318,17 @@ async function main() {
           subtitleStreams.push({
             index: s.index,
             codec,
-            language: s.tags?.language,
-            title: s.tags?.title
+            language: getStreamTag(s, 'language'),
+            title: getStreamTag(s, 'title')
           });
         }
+      } else if (s.codec_type === 'audio') {
+        audioStreams.push({
+          index: s.index,
+          codec: s.codec_name?.toLowerCase(),
+          language: getStreamTag(s, 'language'),
+          title: getStreamTag(s, 'title')
+        });
       }
     });
   }
@@ -383,13 +402,42 @@ async function main() {
     }
   }
 
+  // 7.5 Segment alternative audio tracks (if any)
+  const audioPlaylists = [];
+  if (audioStreams.length > 1) {
+    console.log(`Processing alternative audio tracks (found ${audioStreams.length} total, segmenting from index 1)...`);
+    // Slice from 1 because index 0 is already muxed into variant.m3u8
+    for (const aud of audioStreams.slice(1)) {
+      console.log(`Converting alternative audio stream #${aud.index} (${aud.codec})...`);
+      const audPlaylistPath = path.join(OUTPUT_DIR, `audio_${aud.index}.m3u8`);
+      const audSegmentPattern = path.join(OUTPUT_DIR, `audio_${aud.index}_%05d.m4s`);
+      const audInitName = `audio_${aud.index}_init.mp4`;
+      
+      const audFfmpegCmd = `ffmpeg -y -i "${INPUT_FILE}" -vn -map 0:${aud.index} -c:a aac -b:a 192k -f hls -hls_time 6 -hls_playlist_type vod -hls_segment_type fmp4 -hls_segment_filename "${audSegmentPattern}" -hls_fmp4_init_filename "${audInitName}" "${audPlaylistPath}"`;
+      console.log(`Executing Audio FFmpeg command: ${audFfmpegCmd}`);
+      
+      try {
+        execSync(audFfmpegCmd, { stdio: 'inherit' });
+        const rawAudPlaylist = fs.readFileSync(audPlaylistPath, 'utf8');
+        audioPlaylists.push({
+          streamIndex: aud.index,
+          language: aud.language,
+          title: aud.title,
+          playlistText: rawAudPlaylist
+        });
+      } catch (err) {
+        console.warn(`Warning: Failed to convert alternative audio stream #${aud.index}. Skipping.`);
+      }
+    }
+  }
+
   // Delete input file to release space
   fs.unlinkSync(INPUT_FILE);
 
   // 8. ZIP segments in batches (up to 1GB limit)
   console.log('Grouping segments and packaging ZIPs...');
   const allOutputFiles = fs.readdirSync(OUTPUT_DIR)
-    .filter(name => name.endsWith('.m4s') || name.endsWith('.vtt') || name === 'init.mp4')
+    .filter(name => name.endsWith('.m4s') || name.endsWith('.vtt') || name.endsWith('.mp4'))
     .map(name => {
       const fullPath = path.join(OUTPUT_DIR, name);
       const size = fs.statSync(fullPath).size;
@@ -402,14 +450,19 @@ async function main() {
         const subMatch = name.match(/subtitle_\d+_(\d{5})\.vtt/);
         if (subMatch) {
           segmentIndex = parseInt(subMatch[1], 10);
+        } else {
+          const audMatch = name.match(/audio_\d+_(\d{5})\.m4s/);
+          if (audMatch) {
+            segmentIndex = parseInt(audMatch[1], 10);
+          }
         }
       }
       return { name, fullPath, size, segmentIndex };
     });
 
   allOutputFiles.sort((a, b) => {
-    if (a.name === 'init.mp4') return -1;
-    if (b.name === 'init.mp4') return 1;
+    if (a.name.includes('init') && !b.name.includes('init')) return -1;
+    if (!a.name.includes('init') && b.name.includes('init')) return 1;
     return a.name.localeCompare(b.name);
   });
 
@@ -505,6 +558,30 @@ async function main() {
     });
   }
 
+  const rewrittenAudioPlaylists = [];
+  for (const audPlaylist of audioPlaylists) {
+    const rewrittenText = rewriteVariantPlaylist({
+      playlistText: audPlaylist.playlistText,
+      fileId: file_id,
+      label
+    });
+    
+    const audFileName = `audio_${audPlaylist.streamIndex}.m3u8`;
+    const audPlaylistTmpPath = path.join(WORK_DIR, audFileName);
+    fs.writeFileSync(audPlaylistTmpPath, rewrittenText);
+    
+    console.log(`Uploading rewritten audio playlist #${audPlaylist.streamIndex} as ${audFileName}...`);
+    await uploadAssetFile(uploadUrl, audFileName, audPlaylistTmpPath, 'application/vnd.apple.mpegurl', token);
+    fs.unlinkSync(audPlaylistTmpPath);
+    
+    rewrittenAudioPlaylists.push({
+      streamIndex: audPlaylist.streamIndex,
+      language: audPlaylist.language,
+      title: audPlaylist.title,
+      playlistText: rewrittenText
+    });
+  }
+
   const mainPlaylistTmpPath = path.join(WORK_DIR, 'playlist.m3u8');
   fs.writeFileSync(mainPlaylistTmpPath, rewrittenMainPlaylist);
   console.log('Uploading rewritten main HLS playlist...');
@@ -525,6 +602,7 @@ async function main() {
     playlistText: rewrittenMainPlaylist,
     completedZips,
     subtitles: rewrittenSubtitlePlaylists,
+    audios: rewrittenAudioPlaylists,
     token: vps_callback_token
   };
 
