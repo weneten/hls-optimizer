@@ -168,8 +168,9 @@ function rewriteVariantPlaylist({ playlistText, fileId, label }) {
   const base = `/api/files/${encodeURIComponent(fileId)}/hls/${encodeURIComponent(label)}`;
 
   return playlistText
-    .split('\n')
+    .split(/\r?\n/)
     .map((line) => {
+      line = line.trim();
       if (!line) return line;
       if (line.startsWith('#EXT-X-MAP:')) {
         return line.replace(/URI="([^"]+)"/, (_m, uri) => {
@@ -319,7 +320,7 @@ async function main() {
             index: s.index,
             codec,
             language: getStreamTag(s, 'language'),
-            title: getStreamTag(s, 'title') || getStreamTag(s, 'handler_name') || getStreamTag(s, 'name')
+            title: getStreamTag(s, 'title') || getStreamTag(s, 'name')
           });
         }
       } else if (s.codec_type === 'audio') {
@@ -327,7 +328,7 @@ async function main() {
           index: s.index,
           codec: s.codec_name?.toLowerCase(),
           language: getStreamTag(s, 'language'),
-          title: getStreamTag(s, 'title') || getStreamTag(s, 'handler_name') || getStreamTag(s, 'name')
+          title: getStreamTag(s, 'title') || getStreamTag(s, 'name')
         });
       }
     });
@@ -384,7 +385,7 @@ async function main() {
       const subPlaylistPath = path.join(OUTPUT_DIR, `subtitle_${sub.index}.m3u8`);
       const subSegmentPattern = path.join(OUTPUT_DIR, `subtitle_${sub.index}_%05d.vtt`);
       
-      const subFfmpegCmd = `ffmpeg -y -i "${INPUT_FILE}" -vn -an -map 0:${sub.index} -c:s webvtt -f segment -segment_time 4 -segment_list_type m3u8 -segment_list "${subPlaylistPath}" "${subSegmentPattern}"`;
+      const subFfmpegCmd = `ffmpeg -y -i "${INPUT_FILE}" -vn -an -map 0:${sub.index} -c:s webvtt -f segment -segment_time 6 -write_empty_segments 1 -segment_list_type m3u8 -segment_list "${subPlaylistPath}" "${subSegmentPattern}"`;
       console.log(`Executing Subtitle FFmpeg command: ${subFfmpegCmd}`);
       
       try {
@@ -461,8 +462,17 @@ async function main() {
     });
 
   allOutputFiles.sort((a, b) => {
-    if (a.name.includes('init') && !b.name.includes('init')) return -1;
-    if (!a.name.includes('init') && b.name.includes('init')) return 1;
+    const isInitA = a.name.includes('init');
+    const isInitB = b.name.includes('init');
+    if (isInitA && !isInitB) return -1;
+    if (!isInitA && isInitB) return 1;
+    
+    const idxA = a.segmentIndex !== null ? a.segmentIndex : -1;
+    const idxB = b.segmentIndex !== null ? b.segmentIndex : -1;
+    if (idxA !== idxB) {
+      return idxA - idxB;
+    }
+    
     return a.name.localeCompare(b.name);
   });
 
@@ -588,27 +598,6 @@ async function main() {
   await uploadAssetFile(uploadUrl, 'playlist.m3u8', mainPlaylistTmpPath, 'application/vnd.apple.mpegurl', token);
   fs.unlinkSync(mainPlaylistTmpPath);
 
-  const callbackAudios = [];
-  if (audioStreams.length > 0) {
-    // Default audio track (muxed)
-    callbackAudios.push({
-      streamIndex: audioStreams[0].index,
-      language: audioStreams[0].language,
-      title: audioStreams[0].title,
-      isDefault: true
-    });
-    
-    // Add rewritten alternative audio tracks
-    for (const aud of rewrittenAudioPlaylists) {
-      callbackAudios.push({
-        streamIndex: aud.streamIndex,
-        language: aud.language,
-        title: aud.title,
-        isDefault: false
-      });
-    }
-  }
-
   // 10. Callback to VPS to notify completeness
   console.log(`Sending success callback to VPS at: ${vps_callback_url}`);
   const callbackBody = {
@@ -623,7 +612,7 @@ async function main() {
     playlistText: rewrittenMainPlaylist,
     completedZips,
     subtitles: rewrittenSubtitlePlaylists,
-    audios: callbackAudios,
+    audios: rewrittenAudioPlaylists,
     token: vps_callback_token
   };
 
