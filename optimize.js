@@ -352,13 +352,11 @@ async function main() {
     '-hls_segment_filename', `"${segmentPattern}"`,
     '-hls_fmp4_init_filename', 'init.mp4',
     '-hls_flags', 'independent_segments',
-    '-map', '0:v',
-    '-map', '0:a'
+    '-map', '0:v'
   ];
 
   if (kind === 'original') {
     ffmpegArgs.push('-c:v', 'copy');
-    ffmpegArgs.push(hasAacAudio ? ['-c:a', 'copy'] : ['-c:a', 'aac']);
   } else {
     // Compressed variant
     const tHeight = target_height || 1080;
@@ -367,8 +365,6 @@ async function main() {
       '-preset', hls_preset,
       '-crf', hls_crf,
       '-vf', `"scale='trunc(oh*a/2)*2':'trunc(min(${tHeight},ih)/2)*2'"`,
-      '-c:a', 'aac',
-      '-b:a', '192k',
       '-force_key_frames', '"expr:gte(t,n_forced*6)"'
     );
   }
@@ -405,13 +401,12 @@ async function main() {
     }
   }
 
-  // 7.5 Segment alternative audio tracks (only for the 'original' variant - shared across all variants via master playlist)
+  // 7.5 Segment all audio tracks (only for the 'original' variant - shared across all variants via master playlist)
   const audioPlaylists = [];
-  if (kind === 'original' && audioStreams.length > 1) {
-    console.log(`Processing alternative audio tracks (found ${audioStreams.length} total, segmenting from index 1)...`);
-    // Slice from 1 because index 0 is already muxed into variant.m3u8
-    for (const aud of audioStreams.slice(1)) {
-      console.log(`Converting alternative audio stream #${aud.index} (${aud.codec})...`);
+  if (kind === 'original' && audioStreams.length > 0) {
+    console.log(`Processing audio tracks (found ${audioStreams.length} total)...`);
+    for (const aud of audioStreams) {
+      console.log(`Converting audio stream #${aud.index} (${aud.codec})...`);
       const audPlaylistPath = path.join(OUTPUT_DIR, `audio_${aud.index}.m3u8`);
       const audSegmentPattern = path.join(OUTPUT_DIR, `audio_${aud.index}_%05d.m4s`);
       const audInitName = `audio_${aud.index}_init.mp4`;
@@ -429,7 +424,7 @@ async function main() {
           playlistText: rawAudPlaylist
         });
       } catch (err) {
-        console.warn(`Warning: Failed to convert alternative audio stream #${aud.index}. Skipping.`);
+        console.warn(`Warning: Failed to convert audio stream #${aud.index}. Skipping.`);
       }
     }
   }
@@ -605,10 +600,9 @@ async function main() {
 
   // Build audio metadata for the master playlist. Every variant reports all audio
   // streams (so the backend can mark the default in the master regardless of which
-  // variant finishes last), but only the 'original' variant actually uploads
-  // per-track audio playlist assets (audio_<index>.m3u8). The default audio track
-  // is always the first audio stream and is muxed into the variant playlist, so it
-  // does NOT need a separate URI in the master.
+  // variant finishes last). Since we are doing demuxed audio, all audio tracks (including
+  // the default one) are uploaded as separate audio playlist assets (audio_<index>.m3u8)
+  // and have their own URIs in the master playlist.
   const audiosForCallback = audioStreams.map((aud, i) => ({
     streamIndex: aud.index,
     language: aud.language,
