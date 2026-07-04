@@ -184,6 +184,29 @@ function rewriteVariantPlaylist({ playlistText, fileId, label }) {
     .join('\n');
 }
 
+async function createNewRelease(owner, repo, fileId, label, partIndex, token) {
+  const tagName = `hls-${fileId}-${label}-part${partIndex}-${Date.now()}`;
+  const releaseName = `[HLS] File ${fileId} - ${label} (Part ${partIndex})`;
+  const releaseUrl = `https://api.github.com/repos/${owner}/${repo}/releases`;
+  
+  const res = await apiRequest(releaseUrl, 'POST', {
+    'Authorization': `Bearer ${token}`,
+    'Accept': 'application/vnd.github+json',
+  }, {
+    tag_name: tagName,
+    name: releaseName,
+    body: `Rotated HLS release for file ID: ${fileId}\nVariant: ${label}\nPart: ${partIndex}`,
+    draft: false,
+    prerelease: true,
+  });
+  
+  const data = JSON.parse(res.body.toString('utf8'));
+  return {
+    releaseId: data.id,
+    uploadUrl: data.upload_url,
+  };
+}
+
 async function main() {
   const payloadStr = process.env.EVENT_PAYLOAD;
   const token = process.env.PRIVATE_REPO_TOKEN;
@@ -243,6 +266,28 @@ async function main() {
   });
   const targetReleaseInfo = JSON.parse(targetReleaseRes.body.toString('utf8'));
   const uploadUrl = targetReleaseInfo.upload_url;
+
+  // Release rotation variables for handling large numbers of assets (>750)
+  let currentReleaseId = release_id;
+  let currentUploadUrl = uploadUrl;
+  let assetsUploadedInCurrentRelease = 0;
+  const githubReleaseIds = [release_id];
+
+  async function uploadAssetWithRotation(assetName, filePath, contentType) {
+    if (assetsUploadedInCurrentRelease >= 750) {
+      console.log(`Current release ${currentReleaseId} has reached the asset limit (${assetsUploadedInCurrentRelease} assets). Creating a new release...`);
+      const newReleaseCount = githubReleaseIds.length + 1;
+      const newRelease = await createNewRelease(owner, repo, file_id, label, newReleaseCount, token);
+      currentReleaseId = newRelease.releaseId;
+      currentUploadUrl = newRelease.uploadUrl;
+      githubReleaseIds.push(currentReleaseId);
+      assetsUploadedInCurrentRelease = 0;
+    }
+    
+    const res = await uploadAssetFile(currentUploadUrl, assetName, filePath, contentType, token);
+    assetsUploadedInCurrentRelease++;
+    return res;
+  }
 
   // Filter out and sort the split parts from the source release
   let partAssets = sourceReleaseInfo.assets
@@ -493,7 +538,7 @@ async function main() {
     
     const zipSize = fs.statSync(zipPath).size;
     console.log(`Uploading ${zipName} (${(zipSize / 1024 / 1024).toFixed(1)} MB)...`);
-    const uploadRes = await uploadAssetFile(uploadUrl, zipName, zipPath, 'application/zip', token);
+    const uploadRes = await uploadAssetWithRotation(zipName, zipPath, 'application/zip');
     
     completedZips.push({
       zipIndex: currentZipIndex,
@@ -554,7 +599,7 @@ async function main() {
     fs.writeFileSync(subPlaylistTmpPath, rewrittenText);
     
     console.log(`Uploading rewritten subtitle playlist #${subPlaylist.streamIndex} as ${subFileName}...`);
-    await uploadAssetFile(uploadUrl, subFileName, subPlaylistTmpPath, 'application/vnd.apple.mpegurl', token);
+    await uploadAssetWithRotation(subFileName, subPlaylistTmpPath, 'application/vnd.apple.mpegurl');
     fs.unlinkSync(subPlaylistTmpPath);
     
     rewrittenSubtitlePlaylists.push({
@@ -578,7 +623,7 @@ async function main() {
     fs.writeFileSync(audPlaylistTmpPath, rewrittenText);
     
     console.log(`Uploading rewritten audio playlist #${audPlaylist.streamIndex} as ${audFileName}...`);
-    await uploadAssetFile(uploadUrl, audFileName, audPlaylistTmpPath, 'application/vnd.apple.mpegurl', token);
+    await uploadAssetWithRotation(audFileName, audPlaylistTmpPath, 'application/vnd.apple.mpegurl');
     fs.unlinkSync(audPlaylistTmpPath);
     
     rewrittenAudioPlaylists.push({
@@ -592,7 +637,7 @@ async function main() {
   const mainPlaylistTmpPath = path.join(WORK_DIR, 'playlist.m3u8');
   fs.writeFileSync(mainPlaylistTmpPath, rewrittenMainPlaylist);
   console.log('Uploading rewritten main HLS playlist...');
-  await uploadAssetFile(uploadUrl, 'playlist.m3u8', mainPlaylistTmpPath, 'application/vnd.apple.mpegurl', token);
+  await uploadAssetWithRotation('playlist.m3u8', mainPlaylistTmpPath, 'application/vnd.apple.mpegurl');
   fs.unlinkSync(mainPlaylistTmpPath);
 
   // 10. Callback to VPS to notify completeness
@@ -619,6 +664,7 @@ async function main() {
     height: outputHeight,
     codec: inferredCodec,
     githubReleaseId: release_id,
+    githubReleaseIds,
     playlistText: rewrittenMainPlaylist,
     completedZips,
     // Only the original variant uploads subtitle/audio playlist assets.
