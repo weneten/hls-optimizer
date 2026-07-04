@@ -311,28 +311,30 @@ async function main() {
   const textSubtitleCodecs = new Set(['ass', 'ssa', 'srt', 'subrip', 'webvtt', 'mov_text', 'text']);
   const subtitleStreams = [];
   const audioStreams = [];
-  if (kind === 'original') {
-    probeData.streams.forEach(s => {
-      if (s.codec_type === 'subtitle') {
-        const codec = s.codec_name?.toLowerCase();
-        if (codec && textSubtitleCodecs.has(codec)) {
-          subtitleStreams.push({
-            index: s.index,
-            codec,
-            language: getStreamTag(s, 'language'),
-            title: getStreamTag(s, 'title') || getStreamTag(s, 'name')
-          });
-        }
-      } else if (s.codec_type === 'audio') {
-        audioStreams.push({
+  // Probe audio + subtitle streams for every variant so we know what is present.
+  // Audio + subtitle assets are only SEGMENTED + UPLOADED by the 'original' variant
+  // (stored once, shared by all variants via the master playlist). Compressed variants
+  // only need the metadata so they can flag the default audio in their callback.
+  probeData.streams.forEach(s => {
+    if (s.codec_type === 'subtitle') {
+      const codec = s.codec_name?.toLowerCase();
+      if (codec && textSubtitleCodecs.has(codec)) {
+        subtitleStreams.push({
           index: s.index,
-          codec: s.codec_name?.toLowerCase(),
+          codec,
           language: getStreamTag(s, 'language'),
           title: getStreamTag(s, 'title') || getStreamTag(s, 'name')
         });
       }
-    });
-  }
+    } else if (s.codec_type === 'audio') {
+      audioStreams.push({
+        index: s.index,
+        codec: s.codec_name?.toLowerCase(),
+        language: getStreamTag(s, 'language'),
+        title: getStreamTag(s, 'title') || getStreamTag(s, 'name')
+      });
+    }
+  });
 
   // 6. Segment Video & Audio
   console.log('Running FFmpeg segmenting on video...');
@@ -376,9 +378,9 @@ async function main() {
   console.log(`Executing FFmpeg command: ${ffmpegCmd}`);
   execSync(ffmpegCmd, { stdio: 'inherit' });
 
-  // 7. Segment Subtitles
+  // 7. Segment Subtitles (only for the 'original' variant - shared across all variants via master playlist)
   const subtitlePlaylists = [];
-  if (subtitleStreams.length > 0) {
+  if (kind === 'original' && subtitleStreams.length > 0) {
     console.log(`Processing ${subtitleStreams.length} subtitle streams...`);
     for (const sub of subtitleStreams) {
       console.log(`Converting subtitle stream #${sub.index} (${sub.codec})...`);
@@ -403,9 +405,9 @@ async function main() {
     }
   }
 
-  // 7.5 Segment alternative audio tracks (if any)
+  // 7.5 Segment alternative audio tracks (only for the 'original' variant - shared across all variants via master playlist)
   const audioPlaylists = [];
-  if (audioStreams.length > 1) {
+  if (kind === 'original' && audioStreams.length > 1) {
     console.log(`Processing alternative audio tracks (found ${audioStreams.length} total, segmenting from index 1)...`);
     // Slice from 1 because index 0 is already muxed into variant.m3u8
     for (const aud of audioStreams.slice(1)) {
@@ -600,6 +602,20 @@ async function main() {
 
   // 10. Callback to VPS to notify completeness
   console.log(`Sending success callback to VPS at: ${vps_callback_url}`);
+
+  // Build audio metadata for the master playlist. Every variant reports all audio
+  // streams (so the backend can mark the default in the master regardless of which
+  // variant finishes last), but only the 'original' variant actually uploads
+  // per-track audio playlist assets (audio_<index>.m3u8). The default audio track
+  // is always the first audio stream and is muxed into the variant playlist, so it
+  // does NOT need a separate URI in the master.
+  const audiosForCallback = audioStreams.map((aud, i) => ({
+    streamIndex: aud.index,
+    language: aud.language,
+    title: aud.title,
+    isDefault: i === 0
+  }));
+
   const callbackBody = {
     fileId: file_id,
     userId: user_id,
@@ -611,8 +627,11 @@ async function main() {
     githubReleaseId: release_id,
     playlistText: rewrittenMainPlaylist,
     completedZips,
+    // Only the original variant uploads subtitle/audio playlist assets.
+    // Compressed variants send empty arrays here; the backend dedupes across variants
+    // and sources the shared audio+subtitles from the original variant.
     subtitles: rewrittenSubtitlePlaylists,
-    audios: rewrittenAudioPlaylists,
+    audios: audiosForCallback,
     token: vps_callback_token
   };
 
