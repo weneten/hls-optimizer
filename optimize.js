@@ -459,6 +459,16 @@ async function main() {
       
       try {
         execSync(subFfmpegCmd, { stdio: 'inherit' });
+
+        // Strip all HTML/CSS tags from VTT segments so the player applies a uniform style
+        const vttFiles = fs.readdirSync(OUTPUT_DIR)
+          .filter(name => name.startsWith(`subtitle_${sub.index}_`) && name.endsWith('.vtt'));
+        for (const vttFile of vttFiles) {
+          const vttPath = path.join(OUTPUT_DIR, vttFile);
+          const content = fs.readFileSync(vttPath, 'utf8');
+          fs.writeFileSync(vttPath, content.replace(/<[^>]*>/g, ''), 'utf8');
+        }
+
         const rawSubPlaylist = fs.readFileSync(subPlaylistPath, 'utf8');
         subtitlePlaylists.push({
           streamIndex: sub.index,
