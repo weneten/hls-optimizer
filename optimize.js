@@ -231,6 +231,7 @@ async function main() {
     label,
     kind,
     target_height,
+    subtitle_metadata,
     vps,
     vps_callback_url: flat_vps_callback_url,
     vps_callback_token: flat_vps_callback_token
@@ -378,11 +379,20 @@ async function main() {
       const codec = s.codec_name?.toLowerCase();
       if (codec && textSubtitleCodecs.has(codec)) {
         const lang = getStreamTag(s, 'language');
+        // If subtitle_metadata is provided from the payload (VPS-probed from original file),
+        // use it to get the correct title. The recombined file may lose subtitle name tags.
+        let title = getStreamTag(s, 'title') || getStreamTag(s, 'name') || getLanguageName(lang);
+        if (subtitle_metadata && Array.isArray(subtitle_metadata)) {
+          const match = subtitle_metadata.find(m => m.streamIndex === s.index);
+          if (match && match.title) {
+            title = match.title;
+          }
+        }
         subtitleStreams.push({
           index: s.index,
           codec,
           language: lang,
-          title: getStreamTag(s, 'title') || getStreamTag(s, 'name') || getLanguageName(lang)
+          title
         });
       }
     } else if (s.codec_type === 'audio') {
