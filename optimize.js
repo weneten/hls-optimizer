@@ -329,7 +329,7 @@ async function main() {
 
   // 5. Probe video stream properties
   console.log('Probing video stream properties...');
-  const probeCmd = `ffprobe -v error -show_entries "format=duration:stream=index,codec_type,codec_name,width,height:stream_tags=language,title" -of json "${INPUT_FILE}"`;
+  const probeCmd = `ffprobe -v error -show_entries "format=duration:stream=index,codec_type,codec_name,width,height:stream_tags" -of json "${INPUT_FILE}"`;
   const probeData = JSON.parse(execSync(probeCmd, { maxBuffer: 100 * 1024 * 1024 }).toString());
 
   const videoStream = probeData.streams.find(s => s.codec_type === 'video');
