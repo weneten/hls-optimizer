@@ -231,7 +231,6 @@ async function main() {
     label,
     kind,
     target_height,
-    subtitle_metadata,
     vps,
     vps_callback_url: flat_vps_callback_url,
     vps_callback_token: flat_vps_callback_token
@@ -241,6 +240,7 @@ async function main() {
   const vps_callback_token = vps ? vps.callback_token : flat_vps_callback_token;
   const hls_preset = (vps && vps.preset) ? vps.preset : 'veryfast';
   const hls_crf = (vps && vps.crf !== undefined) ? String(vps.crf) : '20';
+  const subtitle_metadata = vps ? vps.subtitle_metadata : undefined;
 
   console.log(`Starting HLS Optimization Job for file: ${file_id} (Release: ${release_id}, Label: ${label}, Kind: ${kind}, Preset: ${hls_preset}, CRF: ${hls_crf})`);
 
