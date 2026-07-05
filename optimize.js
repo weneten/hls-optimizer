@@ -453,7 +453,8 @@ async function main() {
       const subPlaylistPath = path.join(OUTPUT_DIR, `subtitle_${sub.index}.m3u8`);
       const subSegmentPattern = path.join(OUTPUT_DIR, `subtitle_${sub.index}_%05d.vtt`);
       
-      const subFfmpegCmd = `ffmpeg -y -i "${INPUT_FILE}" -vn -an -map 0:${sub.index} -c:s webvtt -f segment -segment_time 6 -write_empty_segments 1 -segment_list_type m3u8 -segment_list "${subPlaylistPath}" "${subSegmentPattern}"`;
+      const videoDuration = probeData.format ? probeData.format.duration : null;
+      const subFfmpegCmd = `ffmpeg -y -i "${INPUT_FILE}" -vn -an -map 0:${sub.index} -c:s webvtt -f segment -segment_time 6 -write_empty_segments 1${videoDuration ? ` -t ${videoDuration}` : ''} -segment_list_type m3u8 -segment_list "${subPlaylistPath}" "${subSegmentPattern}"`;
       console.log(`Executing Subtitle FFmpeg command: ${subFfmpegCmd}`);
       
       try {
