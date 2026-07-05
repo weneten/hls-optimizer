@@ -356,6 +356,19 @@ async function main() {
   const textSubtitleCodecs = new Set(['ass', 'ssa', 'srt', 'subrip', 'webvtt', 'mov_text', 'text']);
   const subtitleStreams = [];
   const audioStreams = [];
+
+  function getLanguageName(langCode) {
+    if (!langCode || langCode === 'und') return undefined;
+    try {
+      const dn = new Intl.DisplayNames(['en'], { type: 'language' });
+      const name = dn.of(langCode);
+      if (name && name !== langCode && name !== 'root') return name;
+    } catch (e) {
+      // Ignore
+    }
+    return undefined;
+  }
+
   // Probe audio + subtitle streams for every variant so we know what is present.
   // Audio + subtitle assets are only SEGMENTED + UPLOADED by the 'original' variant
   // (stored once, shared by all variants via the master playlist). Compressed variants
@@ -364,19 +377,21 @@ async function main() {
     if (s.codec_type === 'subtitle') {
       const codec = s.codec_name?.toLowerCase();
       if (codec && textSubtitleCodecs.has(codec)) {
+        const lang = getStreamTag(s, 'language');
         subtitleStreams.push({
           index: s.index,
           codec,
-          language: getStreamTag(s, 'language'),
-          title: getStreamTag(s, 'title') || getStreamTag(s, 'name')
+          language: lang,
+          title: getStreamTag(s, 'title') || getStreamTag(s, 'name') || getLanguageName(lang)
         });
       }
     } else if (s.codec_type === 'audio') {
+      const lang = getStreamTag(s, 'language');
       audioStreams.push({
         index: s.index,
         codec: s.codec_name?.toLowerCase(),
-        language: getStreamTag(s, 'language'),
-        title: getStreamTag(s, 'title') || getStreamTag(s, 'name')
+        language: lang,
+        title: getStreamTag(s, 'title') || getStreamTag(s, 'name') || getLanguageName(lang)
       });
     }
   });
