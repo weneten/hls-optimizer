@@ -234,7 +234,25 @@ function formatTimestamp(seconds) {
   return `${hrsStr}:${minsStr}:${secsStr}`;
 }
 
-function segmentVtt(vttContent, segmentTime, videoDuration, outputDir, subIndex) {
+function parseSegmentDurations(playlistText) {
+  const durations = [];
+  const lines = playlistText.split(/\r?\n/);
+  for (const line of lines) {
+    if (line.startsWith('#EXTINF:')) {
+      const commaIdx = line.indexOf(',');
+      const durStr = commaIdx !== -1 
+        ? line.substring(8, commaIdx).trim() 
+        : line.substring(8).trim();
+      const dur = parseFloat(durStr);
+      if (!isNaN(dur)) {
+        durations.push(dur);
+      }
+    }
+  }
+  return durations;
+}
+
+function segmentVtt(vttContent, segmentDurations, videoDuration, outputDir, subIndex) {
   const lines = vttContent.split(/\r?\n/);
   const cues = [];
   let i = 0;
@@ -295,13 +313,32 @@ function segmentVtt(vttContent, segmentTime, videoDuration, outputDir, subIndex)
     }
   }
   
-  const totalDuration = videoDuration || (cues.length > 0 ? Math.max(...cues.map(c => c.end)) : 0);
-  const numSegments = Math.ceil(totalDuration / segmentTime);
+  if (segmentDurations.length === 0) {
+    const fallbackTime = 6;
+    const totalDuration = videoDuration || (cues.length > 0 ? Math.max(...cues.map(c => c.end)) : 0);
+    const fallbackNum = Math.ceil(totalDuration / fallbackTime);
+    for (let segIdx = 0; segIdx < fallbackNum; segIdx++) {
+      segmentDurations.push(segIdx === fallbackNum - 1 ? (totalDuration - segIdx * fallbackTime) : fallbackTime);
+    }
+  }
+  
+  const numSegments = segmentDurations.length;
+  const segStarts = [];
+  const segEnds = [];
+  let accumTime = 0;
+  for (let segIdx = 0; segIdx < numSegments; segIdx++) {
+    segStarts.push(accumTime);
+    accumTime += segmentDurations[segIdx];
+    segEnds.push(accumTime);
+  }
+  
   const segmentFiles = [];
+  const maxTargetDuration = numSegments > 0 ? Math.max(...segmentDurations) : 6;
   
   for (let segIdx = 0; segIdx < numSegments; segIdx++) {
-    const segStart = segIdx * segmentTime;
-    const segEnd = (segIdx + 1) * segmentTime;
+    const segStart = segStarts[segIdx];
+    const segEnd = segEnds[segIdx];
+    const segmentTime = segmentDurations[segIdx];
     const mpegts = Math.round(segStart * 90000);
     
     let segmentContent = `WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:${mpegts}\n\n`;
@@ -326,9 +363,9 @@ function segmentVtt(vttContent, segmentTime, videoDuration, outputDir, subIndex)
     segmentFiles.push(fileName);
   }
   
-  let playlistText = `#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:${segmentTime}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n`;
+  let playlistText = `#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:${Math.ceil(maxTargetDuration)}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n`;
   for (let segIdx = 0; segIdx < numSegments; segIdx++) {
-    const duration = (segIdx === numSegments - 1) ? (totalDuration - segIdx * segmentTime) : segmentTime;
+    const duration = segmentDurations[segIdx];
     playlistText += `#EXTINF:${duration.toFixed(6)},\nsubtitle_${subIndex}_${String(segIdx).padStart(5, '0')}.vtt\n`;
   }
   playlistText += '#EXT-X-ENDLIST\n';
@@ -594,8 +631,14 @@ async function main() {
         if (fs.existsSync(fullVttPath)) {
           const fullContent = fs.readFileSync(fullVttPath, 'utf8');
           
+          let segmentDurations = [];
+          if (fs.existsSync(playlistPath)) {
+            const videoPlaylistText = fs.readFileSync(playlistPath, 'utf8');
+            segmentDurations = parseSegmentDurations(videoPlaylistText);
+          }
+          
           // Step 2 & 3 & 4: Parse, clean, segment and generate playlist in JS
-          const playlistText = segmentVtt(fullContent, 6, videoDuration, OUTPUT_DIR, sub.index);
+          const playlistText = segmentVtt(fullContent, segmentDurations, videoDuration, OUTPUT_DIR, sub.index);
           fs.writeFileSync(subPlaylistPath, playlistText);
           
           subtitlePlaylists.push({
