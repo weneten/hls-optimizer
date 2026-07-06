@@ -207,6 +207,135 @@ async function createNewRelease(owner, repo, fileId, label, partIndex, token) {
   };
 }
 
+function parseTimestamp(ts) {
+  const parts = ts.trim().split(':');
+  if (parts.length === 2) {
+    const minutes = parseInt(parts[0], 10);
+    const seconds = parseFloat(parts[1]);
+    return minutes * 60 + seconds;
+  } else if (parts.length === 3) {
+    const hours = parseInt(parts[0], 10);
+    const minutes = parseInt(parts[1], 10);
+    const seconds = parseFloat(parts[2]);
+    return hours * 3600 + minutes * 60 + seconds;
+  }
+  return 0;
+}
+
+function formatTimestamp(seconds) {
+  const hrs = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds - hrs * 3600) / 60);
+  const secs = seconds - hrs * 3600 - mins * 60;
+  
+  const hrsStr = String(hrs).padStart(2, '0');
+  const minsStr = String(mins).padStart(2, '0');
+  const secsStr = secs.toFixed(3).padStart(6, '0');
+  
+  return `${hrsStr}:${minsStr}:${secsStr}`;
+}
+
+function segmentVtt(vttContent, segmentTime, videoDuration, outputDir, subIndex) {
+  const lines = vttContent.split(/\r?\n/);
+  const cues = [];
+  let i = 0;
+  
+  while (i < lines.length && lines[i].trim() !== '') {
+    i++;
+  }
+  
+  while (i < lines.length) {
+    if (lines[i].trim() === '') {
+      i++;
+      continue;
+    }
+    
+    let id = undefined;
+    if (!lines[i].includes('-->')) {
+      id = lines[i].trim();
+      i++;
+    }
+    
+    if (i < lines.length && lines[i].includes('-->')) {
+      const tsLine = lines[i].trim();
+      const parts = tsLine.split('-->');
+      const startStr = parts[0].trim();
+      const rest = parts[1].trim();
+      
+      const spaceIdx = rest.indexOf(' ');
+      let endStr = rest;
+      let settings = '';
+      if (spaceIdx !== -1) {
+        endStr = rest.substring(0, spaceIdx).trim();
+        settings = rest.substring(spaceIdx).trim();
+      }
+      
+      const start = parseTimestamp(startStr);
+      const end = parseTimestamp(endStr);
+      
+      i++;
+      const textLines = [];
+      while (i < lines.length && lines[i].trim() !== '') {
+        textLines.push(lines[i]);
+        i++;
+      }
+      
+      const cleanedText = textLines.join('\n')
+        .replace(/<[^>]*>/g, '')
+        .replace(/\{[^}]*\}/g, '');
+      
+      cues.push({
+        id,
+        start,
+        end,
+        settings,
+        text: cleanedText
+      });
+    } else {
+      i++;
+    }
+  }
+  
+  const totalDuration = videoDuration || (cues.length > 0 ? Math.max(...cues.map(c => c.end)) : 0);
+  const numSegments = Math.ceil(totalDuration / segmentTime);
+  const segmentFiles = [];
+  
+  for (let segIdx = 0; segIdx < numSegments; segIdx++) {
+    const segStart = segIdx * segmentTime;
+    const segEnd = (segIdx + 1) * segmentTime;
+    const mpegts = 900000 + Math.round(segStart * 90000);
+    
+    let segmentContent = `WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:${mpegts}\n\n`;
+    
+    for (const cue of cues) {
+      if (cue.start < segEnd && cue.end > segStart) {
+        const relStart = Math.max(0, cue.start - segStart);
+        const relEnd = Math.min(segmentTime, cue.end - segStart);
+        if (relStart < relEnd) {
+          if (cue.id) {
+            segmentContent += `${cue.id}\n`;
+          }
+          segmentContent += `${formatTimestamp(relStart)} --> ${formatTimestamp(relEnd)}${cue.settings ? ' ' + cue.settings : ''}\n`;
+          segmentContent += `${cue.text}\n\n`;
+        }
+      }
+    }
+    
+    const fileName = `subtitle_${subIndex}_${String(segIdx).padStart(5, '0')}.vtt`;
+    const filePath = path.join(outputDir, fileName);
+    fs.writeFileSync(filePath, segmentContent, 'utf8');
+    segmentFiles.push(fileName);
+  }
+  
+  let playlistText = `#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:${segmentTime}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n`;
+  for (let segIdx = 0; segIdx < numSegments; segIdx++) {
+    const duration = (segIdx === numSegments - 1) ? (totalDuration - segIdx * segmentTime) : segmentTime;
+    playlistText += `#EXTINF:${duration.toFixed(6)},\nsubtitle_${subIndex}_${String(segIdx).padStart(5, '0')}.vtt\n`;
+  }
+  playlistText += '#EXT-X-ENDLIST\n';
+  
+  return playlistText;
+}
+
 async function main() {
   const payloadStr = process.env.EVENT_PAYLOAD;
   const token = process.env.PRIVATE_REPO_TOKEN;
@@ -451,53 +580,46 @@ async function main() {
     for (const sub of subtitleStreams) {
       console.log(`Converting subtitle stream #${sub.index} (${sub.codec})...`);
       const subPlaylistPath = path.join(OUTPUT_DIR, `subtitle_${sub.index}.m3u8`);
-      const subSegmentPattern = path.join(OUTPUT_DIR, `subtitle_${sub.index}_%05d.vtt`);
       const fullVttPath = path.join(OUTPUT_DIR, `subtitle_${sub.index}.vtt`);
       
-      const videoDuration = probeData.format ? probeData.format.duration : null;
+      const videoDuration = (probeData.format && probeData.format.duration) ? parseFloat(probeData.format.duration) : null;
       
-      // Step 1: Extract full subtitle stream to a single VTT file (handles any input format: mov_text, srt, ass, etc.)
+      // Step 1: Extract full subtitle stream to a single VTT file
       const extractCmd = `ffmpeg -y -i "${INPUT_FILE}" -vn -an -map 0:${sub.index} -c:s webvtt${videoDuration ? ` -t ${videoDuration}` : ''} "${fullVttPath}"`;
       console.log(`Executing Subtitle Extract command: ${extractCmd}`);
       
       try {
         execSync(extractCmd, { stdio: 'inherit' });
         
-        // Step 2: Strip all HTML/CSS tags (<...>) and ASS styling tags ({\...}) from the full VTT
         if (fs.existsSync(fullVttPath)) {
           const fullContent = fs.readFileSync(fullVttPath, 'utf8');
-          const cleanedContent = fullContent.replace(/<[^>]*>/g, '').replace(/\{[^}]*\}/g, '');
-          fs.writeFileSync(fullVttPath, cleanedContent, 'utf8');
+          
+          // Step 2 & 3 & 4: Parse, clean, segment and generate playlist in JS
+          const playlistText = segmentVtt(fullContent, 6, videoDuration, OUTPUT_DIR, sub.index);
+          fs.writeFileSync(subPlaylistPath, playlistText);
+          
+          subtitlePlaylists.push({
+            streamIndex: sub.index,
+            language: sub.language,
+            title: sub.title,
+            playlistText: playlistText
+          });
+          
+          // Cleanup full VTT so it isn't picked up by zip batching
+          fs.unlinkSync(fullVttPath);
+          
+          const segCount = fs.readdirSync(OUTPUT_DIR)
+            .filter(name => name.startsWith(`subtitle_${sub.index}_`) && name.endsWith('.vtt')).length;
+          
+          console.log(`Subtitle stream #${sub.index} converted successfully with ${segCount} segments`);
+        } else {
+          console.warn(`Warning: Extracted VTT file not found for stream #${sub.index}`);
         }
-        
-        // Step 3: Segment the cleaned VTT using segment muxer (not hls, to avoid mpegts issues)
-        const segmentCmd = `ffmpeg -y -i "${fullVttPath}" -c copy -f segment -segment_time 6 -segment_format webvtt -reset_timestamps 1 "${subSegmentPattern}"`;
-        console.log(`Executing Subtitle Segment command: ${segmentCmd}`);
-        execSync(segmentCmd, { stdio: 'inherit' });
-        
-        // Step 4: Generate the playlist manually from the segments
-        const vttFiles = fs.readdirSync(OUTPUT_DIR)
-          .filter(name => name.startsWith(`subtitle_${sub.index}_`) && name.endsWith('.vtt'))
-          .sort();
-        
-        let playlistText = '#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:6\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n';
-        for (const vttFile of vttFiles) {
-          playlistText += `#EXTINF:6.000,\n${vttFile}\n`;
-        }
-        playlistText += '#EXT-X-ENDLIST\n';
-        
-        fs.writeFileSync(subPlaylistPath, playlistText);
-        
-        subtitlePlaylists.push({
-          streamIndex: sub.index,
-          language: sub.language,
-          title: sub.title,
-          playlistText: playlistText
-        });
-        
-        console.log(`Subtitle stream #${sub.index} converted successfully with ${vttFiles.length} segments`);
       } catch (err) {
         console.warn(`Warning: Failed to convert subtitle stream #${sub.index}. Skipping.`);
+        if (fs.existsSync(fullVttPath)) {
+          try { fs.unlinkSync(fullVttPath); } catch (e) {}
+        }
       }
     }
   }
