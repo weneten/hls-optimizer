@@ -452,40 +452,59 @@ async function main() {
       console.log(`Converting subtitle stream #${sub.index} (${sub.codec})...`);
       const subPlaylistPath = path.join(OUTPUT_DIR, `subtitle_${sub.index}.m3u8`);
       const subSegmentPattern = path.join(OUTPUT_DIR, `subtitle_${sub.index}_%05d.vtt`);
+      const fullVttPath = path.join(OUTPUT_DIR, `subtitle_${sub.index}.vtt`);
       
       const videoDuration = probeData.format ? probeData.format.duration : null;
-      const subFfmpegCmd = `ffmpeg -y -i "${INPUT_FILE}" -vn -an -map 0:${sub.index} -c:s webvtt -f hls -hls_time 6 -hls_playlist_type vod -hls_flags independent_segments${videoDuration ? ` -t ${videoDuration}` : ''} -hls_segment_filename "${subSegmentPattern}" "${subPlaylistPath}"`;
-      console.log(`Executing Subtitle FFmpeg command: ${subFfmpegCmd}`);
+      
+      // Step 1: Extract full subtitle stream to a single VTT file (handles any input format: mov_text, srt, ass, etc.)
+      const extractCmd = `ffmpeg -y -i "${INPUT_FILE}" -vn -an -map 0:${sub.index} -c:s webvtt${videoDuration ? ` -t ${videoDuration}` : ''} "${fullVttPath}"`;
+      console.log(`Executing Subtitle Extract command: ${extractCmd}`);
       
       try {
-        execSync(subFfmpegCmd, { stdio: 'inherit' });
-
-        // Strip all HTML/CSS tags (<...>) and ASS styling tags ({\...}) from VTT segments
-        const vttFiles = fs.readdirSync(OUTPUT_DIR)
-          .filter(name => name.startsWith(`subtitle_${sub.index}_`) && name.endsWith('.vtt'));
-        for (const vttFile of vttFiles) {
-          const vttPath = path.join(OUTPUT_DIR, vttFile);
-          const content = fs.readFileSync(vttPath, 'utf8');
-          const cleanedContent = content.replace(/<[^>]*>/g, '').replace(/\{[^}]*\}/g, '');
-          fs.writeFileSync(vttPath, cleanedContent, 'utf8');
+        execSync(extractCmd, { stdio: 'inherit' });
+        
+        // Step 2: Strip all HTML/CSS tags (<...>) and ASS styling tags ({\...}) from the full VTT
+        if (fs.existsSync(fullVttPath)) {
+          const fullContent = fs.readFileSync(fullVttPath, 'utf8');
+          const cleanedContent = fullContent.replace(/<[^>]*>/g, '').replace(/\{[^}]*\}/g, '');
+          fs.writeFileSync(fullVttPath, cleanedContent, 'utf8');
         }
-
-        const rawSubPlaylist = fs.readFileSync(subPlaylistPath, 'utf8');
+        
+        // Step 3: Segment the cleaned VTT using segment muxer (not hls, to avoid mpegts issues)
+        const segmentCmd = `ffmpeg -y -i "${fullVttPath}" -c copy -f segment -segment_time 6 -segment_format webvtt -reset_timestamps 1 "${subSegmentPattern}"`;
+        console.log(`Executing Subtitle Segment command: ${segmentCmd}`);
+        execSync(segmentCmd, { stdio: 'inherit' });
+        
+        // Step 4: Generate the playlist manually from the segments
+        const vttFiles = fs.readdirSync(OUTPUT_DIR)
+          .filter(name => name.startsWith(`subtitle_${sub.index}_`) && name.endsWith('.vtt'))
+          .sort();
+        
+        let playlistText = '#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:6\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n';
+        for (const vttFile of vttFiles) {
+          playlistText += `#EXTINF:6.000,\n${vttFile}\n`;
+        }
+        playlistText += '#EXT-X-ENDLIST\n';
+        
+        fs.writeFileSync(subPlaylistPath, playlistText);
+        
         subtitlePlaylists.push({
           streamIndex: sub.index,
           language: sub.language,
           title: sub.title,
-          playlistText: rawSubPlaylist
+          playlistText: playlistText
         });
+        
+        console.log(`Subtitle stream #${sub.index} converted successfully with ${vttFiles.length} segments`);
       } catch (err) {
         console.warn(`Warning: Failed to convert subtitle stream #${sub.index}. Skipping.`);
       }
     }
   }
 
-  // 7.5 Segment all audio tracks (only for 'original' variant or when subtitle_metadata is requested)
+  // 7.5 Segment all audio tracks (always process if present, for all variant kinds)
   const audioPlaylists = [];
-  if ((kind === 'original' || subtitle_metadata !== undefined) && audioStreams.length > 0) {
+  if (audioStreams.length > 0) {
     console.log(`Processing audio tracks (found ${audioStreams.length} total)...`);
     for (const aud of audioStreams) {
       console.log(`Converting audio stream #${aud.index} (${aud.codec})...`);
@@ -704,9 +723,8 @@ async function main() {
     githubReleaseIds,
     playlistText: rewrittenMainPlaylist,
     completedZips,
-    // Only the original variant uploads subtitle/audio playlist assets.
-    // Compressed variants send empty arrays here; the backend dedupes across variants
-    // and sources the shared audio+subtitles from the original variant.
+    // All variants upload subtitle/audio playlist assets (shared across variants via mainLabel in master).
+    // Backend dedupes by streamIndex when building the master playlist.
     subtitles: rewrittenSubtitlePlaylists,
     audios: audiosForCallback,
     token: vps_callback_token
