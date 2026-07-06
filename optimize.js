@@ -444,9 +444,9 @@ async function main() {
   console.log(`Executing FFmpeg command: ${ffmpegCmd}`);
   execSync(ffmpegCmd, { stdio: 'inherit' });
 
-  // 7. Segment Subtitles (only for the 'original' variant - shared across all variants via master playlist)
+  // 7. Segment Subtitles (only for 'original' variant or when subtitle_metadata is requested)
   const subtitlePlaylists = [];
-  if (kind === 'original' && subtitleStreams.length > 0) {
+  if ((kind === 'original' || subtitle_metadata !== undefined) && subtitleStreams.length > 0) {
     console.log(`Processing ${subtitleStreams.length} subtitle streams...`);
     for (const sub of subtitleStreams) {
       console.log(`Converting subtitle stream #${sub.index} (${sub.codec})...`);
@@ -482,9 +482,9 @@ async function main() {
     }
   }
 
-  // 7.5 Segment all audio tracks (only for the 'original' variant - shared across all variants via master playlist)
+  // 7.5 Segment all audio tracks (only for 'original' variant or when subtitle_metadata is requested)
   const audioPlaylists = [];
-  if (kind === 'original' && audioStreams.length > 0) {
+  if ((kind === 'original' || subtitle_metadata !== undefined) && audioStreams.length > 0) {
     console.log(`Processing audio tracks (found ${audioStreams.length} total)...`);
     for (const aud of audioStreams) {
       console.log(`Converting audio stream #${aud.index} (${aud.codec})...`);
