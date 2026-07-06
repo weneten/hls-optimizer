@@ -444,9 +444,9 @@ async function main() {
   console.log(`Executing FFmpeg command: ${ffmpegCmd}`);
   execSync(ffmpegCmd, { stdio: 'inherit' });
 
-  // 7. Segment Subtitles (only for 'original' variant or when subtitle_metadata is requested)
+  // 7. Segment Subtitles (always process if present, for all variant kinds)
   const subtitlePlaylists = [];
-  if ((kind === 'original' || subtitle_metadata !== undefined) && subtitleStreams.length > 0) {
+  if (subtitleStreams.length > 0) {
     console.log(`Processing ${subtitleStreams.length} subtitle streams...`);
     for (const sub of subtitleStreams) {
       console.log(`Converting subtitle stream #${sub.index} (${sub.codec})...`);
