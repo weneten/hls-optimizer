@@ -302,7 +302,7 @@ function segmentVtt(vttContent, segmentTime, videoDuration, outputDir, subIndex)
   for (let segIdx = 0; segIdx < numSegments; segIdx++) {
     const segStart = segIdx * segmentTime;
     const segEnd = (segIdx + 1) * segmentTime;
-    const mpegts = 900000 + Math.round(segStart * 90000);
+    const mpegts = Math.round(segStart * 90000);
     
     let segmentContent = `WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:${mpegts}\n\n`;
     
