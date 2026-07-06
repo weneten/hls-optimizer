@@ -454,19 +454,20 @@ async function main() {
       const subSegmentPattern = path.join(OUTPUT_DIR, `subtitle_${sub.index}_%05d.vtt`);
       
       const videoDuration = probeData.format ? probeData.format.duration : null;
-      const subFfmpegCmd = `ffmpeg -y -i "${INPUT_FILE}" -vn -an -map 0:${sub.index} -c:s webvtt -f segment -segment_time 6 -write_empty_segments 1${videoDuration ? ` -t ${videoDuration}` : ''} -segment_list_type m3u8 -segment_list "${subPlaylistPath}" "${subSegmentPattern}"`;
+      const subFfmpegCmd = `ffmpeg -y -i "${INPUT_FILE}" -vn -an -map 0:${sub.index} -c:s webvtt -f hls -hls_time 6 -hls_playlist_type vod -hls_flags independent_segments${videoDuration ? ` -t ${videoDuration}` : ''} -hls_segment_filename "${subSegmentPattern}" "${subPlaylistPath}"`;
       console.log(`Executing Subtitle FFmpeg command: ${subFfmpegCmd}`);
       
       try {
         execSync(subFfmpegCmd, { stdio: 'inherit' });
 
-        // Strip all HTML/CSS tags from VTT segments so the player applies a uniform style
+        // Strip all HTML/CSS tags (<...>) and ASS styling tags ({\...}) from VTT segments
         const vttFiles = fs.readdirSync(OUTPUT_DIR)
           .filter(name => name.startsWith(`subtitle_${sub.index}_`) && name.endsWith('.vtt'));
         for (const vttFile of vttFiles) {
           const vttPath = path.join(OUTPUT_DIR, vttFile);
           const content = fs.readFileSync(vttPath, 'utf8');
-          fs.writeFileSync(vttPath, content.replace(/<[^>]*>/g, ''), 'utf8');
+          const cleanedContent = content.replace(/<[^>]*>/g, '').replace(/\{[^}]*\}/g, '');
+          fs.writeFileSync(vttPath, cleanedContent, 'utf8');
         }
 
         const rawSubPlaylist = fs.readFileSync(subPlaylistPath, 'utf8');
