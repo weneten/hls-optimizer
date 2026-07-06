@@ -341,7 +341,12 @@ function segmentVtt(vttContent, segmentDurations, videoDuration, outputDir, subI
     const segmentTime = segmentDurations[segIdx];
     const mpegts = Math.round(segStart * 90000);
     
-    let segmentContent = `WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:${mpegts}\n\n`;
+    let segmentContent = `WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:${mpegts}\n\n` +
+      `STYLE\n` +
+      `::cue {\n` +
+      `  background: transparent;\n` +
+      `  text-shadow: 0 0 2px black, 0 0 2px black, 0 0 2px black, 0 0 2px black;\n` +
+      `}\n\n`;
     
     for (const cue of cues) {
       if (cue.start < segEnd && cue.end > segStart) {
