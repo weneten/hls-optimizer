@@ -411,9 +411,16 @@ async function main() {
   const vps_callback_token = vps ? vps.callback_token : flat_vps_callback_token;
   const hls_preset = (vps && vps.preset) ? vps.preset : 'veryfast';
   const hls_crf = (vps && vps.crf !== undefined) ? String(vps.crf) : '20';
+  const hls_maxrate = (vps && vps.maxrate) ? String(vps.maxrate) : undefined;
+  const hls_bufsize = (vps && vps.bufsize) ? String(vps.bufsize) : undefined;
+  const hls_profile = (vps && vps.profile) ? String(vps.profile) : undefined;
+  const hls_level = (vps && vps.level) ? String(vps.level) : undefined;
+  const hls_audio_bitrate = (vps && vps.audio_bitrate !== undefined) ? parseInt(vps.audio_bitrate, 10) : 192;
+  const extract_subtitles = (vps && vps.extract_subtitles !== undefined) ? !!vps.extract_subtitles : true;
+  const extract_audio = (vps && vps.extract_audio !== undefined) ? !!vps.extract_audio : true;
   const subtitle_metadata = vps ? vps.subtitle_metadata : undefined;
 
-  console.log(`Starting HLS Optimization Job for file: ${file_id} (Release: ${release_id}, Label: ${label}, Kind: ${kind}, Preset: ${hls_preset}, CRF: ${hls_crf})`);
+  console.log(`Starting HLS Optimization Job for file: ${file_id} (Release: ${release_id}, Label: ${label}, Kind: ${kind}, Preset: ${hls_preset}, CRF: ${hls_crf}, Maxrate: ${hls_maxrate}, Bufsize: ${hls_bufsize}, Audio Bitrate: ${hls_audio_bitrate}k, extract_subtitles=${extract_subtitles}, extract_audio=${extract_audio})`);
 
   // 1. Prepare directories
   fs.mkdirSync(WORK_DIR, { recursive: true });
@@ -572,6 +579,7 @@ async function main() {
         index: s.index,
         codec: s.codec_name?.toLowerCase(),
         language: lang,
+        channels: s.channels || 2,
         title: getStreamTag(s, 'title') || getStreamTag(s, 'name') || getLanguageName(lang)
       });
     }
@@ -604,9 +612,17 @@ async function main() {
     ffmpegArgs.push(
       '-c:v', 'libx264',
       '-preset', hls_preset,
-      '-crf', hls_crf,
+      '-crf', hls_crf
+    );
+    if (hls_maxrate) ffmpegArgs.push('-maxrate', hls_maxrate);
+    if (hls_bufsize) ffmpegArgs.push('-bufsize', hls_bufsize);
+    if (hls_profile) ffmpegArgs.push('-profile:v', hls_profile);
+    if (hls_level) ffmpegArgs.push('-level', hls_level);
+    ffmpegArgs.push(
       '-vf', `"scale='trunc(oh*a/2)*2':'trunc(min(${tHeight},ih)/2)*2'"`,
-      '-force_key_frames', '"expr:gte(t,n_forced*6)"'
+      '-force_key_frames', '"expr:gte(t,n_forced*6)"',
+      '-sc_threshold', '0',
+      '-flags', '+cgop'
     );
   }
 
@@ -617,7 +633,7 @@ async function main() {
 
   // 7. Segment Subtitles (always process if present, for all variant kinds)
   const subtitlePlaylists = [];
-  if (subtitleStreams.length > 0) {
+  if (extract_subtitles && subtitleStreams.length > 0) {
     console.log(`Processing ${subtitleStreams.length} subtitle streams...`);
     for (const sub of subtitleStreams) {
       console.log(`Converting subtitle stream #${sub.index} (${sub.codec})...`);
@@ -674,7 +690,7 @@ async function main() {
 
   // 7.5 Segment all audio tracks (always process if present, for all variant kinds)
   const audioPlaylists = [];
-  if (audioStreams.length > 0) {
+  if (extract_audio && audioStreams.length > 0) {
     console.log(`Processing audio tracks (found ${audioStreams.length} total)...`);
     for (const aud of audioStreams) {
       console.log(`Converting audio stream #${aud.index} (${aud.codec})...`);
@@ -682,7 +698,9 @@ async function main() {
       const audSegmentPattern = path.join(OUTPUT_DIR, `audio_${aud.index}_%05d.m4s`);
       const audInitName = `audio_${aud.index}_init.mp4`;
       
-      const audFfmpegCmd = `ffmpeg -y -i "${INPUT_FILE}" -vn -map 0:${aud.index} -c:a aac -b:a 192k -f hls -hls_time 6 -hls_playlist_type vod -hls_segment_type fmp4 -hls_segment_filename "${audSegmentPattern}" -hls_fmp4_init_filename "${audInitName}" "${audPlaylistPath}"`;
+      const channels = aud.channels || 2;
+      const targetAudioBitrate = Math.min(768, Math.max(96, Math.round((channels / 2) * hls_audio_bitrate)));
+      const audFfmpegCmd = `ffmpeg -y -i "${INPUT_FILE}" -vn -map 0:${aud.index} -c:a aac -b:a ${targetAudioBitrate}k -f hls -hls_time 6 -hls_playlist_type vod -hls_segment_type fmp4 -hls_segment_filename "${audSegmentPattern}" -hls_fmp4_init_filename "${audInitName}" "${audPlaylistPath}"`;
       console.log(`Executing Audio FFmpeg command: ${audFfmpegCmd}`);
       
       try {
