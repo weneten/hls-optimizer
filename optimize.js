@@ -67,6 +67,114 @@ function checkSvtAv1() {
   }
 }
 
+function adjustVideoParams(label, codec, origBitrateKbps, origHeight, duration, basePreset, baseCrf) {
+  let targetHeight = 1080;
+  const labelMatch = (label || '').match(/(\d+)p/);
+  if (labelMatch) {
+    targetHeight = parseInt(labelMatch[1], 10);
+  }
+
+  let proportionalOrigBitrate = origBitrateKbps;
+  if (origHeight && origHeight > 0 && origBitrateKbps) {
+    proportionalOrigBitrate = origBitrateKbps * Math.pow(targetHeight / origHeight, 1.5);
+  }
+
+  let finalCrf = parseInt(baseCrf, 10);
+  if (isNaN(finalCrf)) {
+    finalCrf = codec === 'av1' ? 30 : 20;
+  }
+
+  // Determine standard expectation thresholds for resolution (H264 vs AV1)
+  let standardBitrate = 4000;
+  if (codec === 'h264') {
+    if (targetHeight <= 360) standardBitrate = 700;
+    else if (targetHeight <= 480) standardBitrate = 1200;
+    else if (targetHeight <= 720) standardBitrate = 2200;
+    else if (targetHeight <= 1080) standardBitrate = 4000;
+    else if (targetHeight <= 1440) standardBitrate = 8000;
+    else standardBitrate = 16000;
+  } else if (codec === 'av1') {
+    if (targetHeight <= 360) standardBitrate = 400;
+    else if (targetHeight <= 480) standardBitrate = 700;
+    else if (targetHeight <= 720) standardBitrate = 1300;
+    else if (targetHeight <= 1080) standardBitrate = 2400;
+    else if (targetHeight <= 1440) standardBitrate = 4800;
+    else standardBitrate = 10000;
+  }
+
+  // If proportional original bitrate is lower than standard, increase CRF (less quality, lower filesize)
+  if (proportionalOrigBitrate && proportionalOrigBitrate < standardBitrate) {
+    const deficitRatio = proportionalOrigBitrate / standardBitrate;
+    const maxIncrease = codec === 'av1' ? 12 : 8;
+    const crfIncrease = Math.round(maxIncrease * (1 - deficitRatio));
+    finalCrf += crfIncrease;
+    
+    const maxCrf = codec === 'av1' ? 42 : 30;
+    if (finalCrf > maxCrf) finalCrf = maxCrf;
+  }
+
+  // Apply strict bitrate cap to guarantee output is smaller than original
+  let maxrate = null;
+  let bufsize = null;
+  if (proportionalOrigBitrate) {
+    const cappedBitrate = Math.max(codec === 'av1' ? 200 : 350, Math.round(proportionalOrigBitrate * 0.90));
+    maxrate = `${cappedBitrate}k`;
+    bufsize = `${cappedBitrate * 2}k`;
+  }
+
+  // Preset adjustment based on target resolution height and final CRF
+  let finalPreset = basePreset;
+  if (codec === 'av1') {
+    // SVT-AV1 presets: 0 (slowest) to 13 (fastest)
+    let minPreset = 6;
+    if (targetHeight >= 2160) minPreset = 8;
+    else if (targetHeight >= 1080) minPreset = 8;
+    else if (targetHeight >= 720) minPreset = 7;
+    
+    let presetNum = parseInt(basePreset, 10);
+    if (isNaN(presetNum)) {
+      presetNum = minPreset;
+    } else {
+      presetNum = Math.max(presetNum, minPreset);
+    }
+
+    // Pair lower (slower) preset numbers with higher CRF to maintain detail on compressed streams,
+    // and higher (faster) preset numbers with lower CRF where bits are plentiful.
+    if (finalCrf >= 35) {
+      presetNum = Math.max(6, presetNum - 2);
+    } else if (finalCrf >= 31) {
+      presetNum = Math.max(6, presetNum - 1);
+    } else if (finalCrf <= 26) {
+      presetNum = Math.min(11, presetNum + 1);
+    }
+    finalPreset = String(presetNum);
+  } else if (codec === 'h264') {
+    // x264 presets: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
+    const presetsList = ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'];
+    let idx = presetsList.indexOf(basePreset);
+    if (idx === -1) idx = 2; // default veryfast
+    
+    let maxAllowedIdx = 8;
+    if (targetHeight >= 2160) maxAllowedIdx = 2; // veryfast
+    else if (targetHeight >= 1080) maxAllowedIdx = 3; // faster
+    else if (targetHeight >= 720) maxAllowedIdx = 4; // fast
+    
+    if (idx > maxAllowedIdx) {
+      idx = maxAllowedIdx;
+    }
+
+    // Adjust based on CRF
+    if (finalCrf >= 26) {
+      idx = Math.min(maxAllowedIdx, idx + 1); // make it slower to maintain details
+    } else if (finalCrf <= 18) {
+      idx = Math.max(0, idx - 1); // make it faster
+    }
+    finalPreset = presetsList[idx];
+  }
+
+  return { crf: String(finalCrf), preset: finalPreset, maxrate, bufsize };
+}
+
 
 // Config and constants
 const WORK_DIR = '/tmp/hls-worker';
@@ -370,7 +478,7 @@ function parseSegmentDurations(playlistText) {
   return durations;
 }
 
-function segmentVtt(vttContent, segmentDurations, videoDuration, outputDir, subIndex) {
+function segmentVtt(vttContent, segmentDurations, videoDuration, outputDir, subIndex, startSegmentNumber) {
   const lines = vttContent.split(/\r?\n/);
   const cues = [];
   let i = 0;
@@ -480,16 +588,19 @@ function segmentVtt(vttContent, segmentDurations, videoDuration, outputDir, subI
       }
     }
     
-    const fileName = `subtitle_${subIndex}_${String(segIdx).padStart(5, '0')}.vtt`;
+    const finalSegIdx = startSegmentNumber !== undefined ? (startSegmentNumber + segIdx) : segIdx;
+    const fileName = `subtitle_${subIndex}_${String(finalSegIdx).padStart(5, '0')}.vtt`;
     const filePath = path.join(outputDir, fileName);
     fs.writeFileSync(filePath, segmentContent, 'utf8');
     segmentFiles.push(fileName);
   }
   
-  let playlistText = `#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:${Math.ceil(maxTargetDuration)}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n`;
+  const mediaSeq = startSegmentNumber !== undefined ? startSegmentNumber : 0;
+  let playlistText = `#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:${Math.ceil(maxTargetDuration)}\n#EXT-X-MEDIA-SEQUENCE:${mediaSeq}\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n`;
   for (let segIdx = 0; segIdx < numSegments; segIdx++) {
     const duration = segmentDurations[segIdx];
-    playlistText += `#EXTINF:${duration.toFixed(6)},\nsubtitle_${subIndex}_${String(segIdx).padStart(5, '0')}.vtt\n`;
+    const finalSegIdx = startSegmentNumber !== undefined ? (startSegmentNumber + segIdx) : segIdx;
+    playlistText += `#EXTINF:${duration.toFixed(6)},\nsubtitle_${subIndex}_${String(finalSegIdx).padStart(5, '0')}.vtt\n`;
   }
   playlistText += '#EXT-X-ENDLIST\n';
   
@@ -537,6 +648,12 @@ async function main() {
   const extract_subtitles = (vps && vps.extract_subtitles !== undefined) ? !!vps.extract_subtitles : true;
   const extract_audio = (vps && vps.extract_audio !== undefined) ? !!vps.extract_audio : true;
   const subtitle_metadata = vps ? vps.subtitle_metadata : undefined;
+  
+  const slice_index = (vps && vps.slice_index !== undefined) ? parseInt(vps.slice_index, 10) : undefined;
+  const total_slices = (vps && vps.total_slices !== undefined) ? parseInt(vps.total_slices, 10) : undefined;
+  const slice_start = (vps && vps.slice_start !== undefined) ? parseFloat(vps.slice_start) : undefined;
+  const slice_duration = (vps && vps.slice_duration !== undefined) ? parseFloat(vps.slice_duration) : undefined;
+  const start_segment_number = (vps && vps.start_segment_number !== undefined) ? parseInt(vps.start_segment_number, 10) : undefined;
 
   // Resolve Codecs list
   let codecs = ['h264'];
@@ -639,7 +756,7 @@ async function main() {
 
   // 5. Probe video stream properties
   console.log('Probing video stream properties...');
-  const probeCmd = `ffprobe -v error -show_entries "format=duration:stream=index,codec_type,codec_name,width,height:stream_tags" -of json "${INPUT_FILE}"`;
+  const probeCmd = `ffprobe -v error -show_entries "format=duration,size,bit_rate:stream=index,codec_type,codec_name,width,height,channels,r_frame_rate,bit_rate:stream_tags" -of json "${INPUT_FILE}"`;
   const probeData = JSON.parse(execSync(probeCmd, { maxBuffer: 100 * 1024 * 1024 }).toString());
 
   const videoStream = probeData.streams.find(s => s.codec_type === 'video');
@@ -650,6 +767,20 @@ async function main() {
   const inferredWidth = videoStream.width || null;
   const inferredHeight = videoStream.height || null;
   const inferredCodec = kind === 'original' ? (videoStream.codec_name || 'copy') : 'h264';
+
+  const format = probeData.format || {};
+  const duration = format.duration ? parseFloat(format.duration) : (vps && vps.duration ? parseFloat(vps.duration) : 0);
+  const fileSize = format.size ? parseInt(format.size, 10) : 0;
+  
+  let origBitrateKbps = vps && vps.source_bitrate_kbps ? parseInt(vps.source_bitrate_kbps, 10) : null;
+  if (!origBitrateKbps) {
+    if (format.bit_rate) {
+      origBitrateKbps = Math.round(parseInt(format.bit_rate, 10) / 1000);
+    } else if (duration > 0 && fileSize > 0) {
+      origBitrateKbps = Math.round((fileSize * 8) / duration / 1000);
+    }
+  }
+  const origHeight = inferredHeight || (vps && vps.source_height ? parseInt(vps.source_height, 10) : null);
 
   let outputWidth = inferredWidth;
   let outputHeight = inferredHeight;
@@ -706,11 +837,13 @@ async function main() {
       }
     } else if (s.codec_type === 'audio') {
       const lang = getStreamTag(s, 'language');
+      const bitRate = s.bit_rate ? parseInt(s.bit_rate, 10) : null;
       audioStreams.push({
         index: s.index,
         codec: s.codec_name?.toLowerCase(),
         language: lang,
         channels: s.channels || 2,
+        bitRate: isNaN(bitRate) ? null : bitRate,
         title: getStreamTag(s, 'title') || getStreamTag(s, 'name') || getLanguageName(lang)
       });
     }
@@ -726,9 +859,10 @@ async function main() {
       const fullVttPath = path.join(OUTPUT_DIR, `subtitle_${sub.index}.vtt`);
       
       const videoDuration = (probeData.format && probeData.format.duration) ? parseFloat(probeData.format.duration) : null;
-      
-      // Step 1: Extract full subtitle stream to a single VTT file
-      const extractCmd = `ffmpeg -y -i "${INPUT_FILE}" -vn -an -map 0:${sub.index} -c:s webvtt${videoDuration ? ` -t ${videoDuration}` : ''} "${fullVttPath}"`;
+      const videoDurationVal = slice_duration !== undefined ? slice_duration : (videoDuration || 0);
+
+      // Step 1: Extract subtitle stream slice to a VTT file
+      const extractCmd = `ffmpeg -y ${slice_start !== undefined ? `-ss ${slice_start} ` : ''}-i "${INPUT_FILE}" ${videoDurationVal ? `-t ${videoDurationVal} ` : ''}-vn -an -map 0:${sub.index} -c:s webvtt "${fullVttPath}"`;
       console.log(`Executing Subtitle Extract command: ${extractCmd}`);
       
       try {
@@ -738,14 +872,13 @@ async function main() {
           const fullContent = fs.readFileSync(fullVttPath, 'utf8');
           
           const segmentDurations = [];
-          const videoDurationVal = videoDuration || 0;
           const fallbackTime = 6;
           const fallbackNum = Math.ceil(videoDurationVal / fallbackTime);
           for (let segIdx = 0; segIdx < fallbackNum; segIdx++) {
             segmentDurations.push(segIdx === fallbackNum - 1 ? (videoDurationVal - segIdx * fallbackTime) : fallbackTime);
           }
           
-          const playlistText = segmentVtt(fullContent, segmentDurations, videoDuration, OUTPUT_DIR, sub.index);
+          const playlistText = segmentVtt(fullContent, segmentDurations, videoDurationVal, OUTPUT_DIR, sub.index, start_segment_number);
           fs.writeFileSync(subPlaylistPath, playlistText);
           
           subtitlePlaylists.push({
@@ -779,11 +912,33 @@ async function main() {
       console.log(`Converting audio stream #${aud.index} (${aud.codec})...`);
       const audPlaylistPath = path.join(OUTPUT_DIR, `audio_${aud.index}.m3u8`);
       const audSegmentPattern = path.join(OUTPUT_DIR, `audio_${aud.index}_%05d.m4s`);
-      const audInitName = `audio_${aud.index}_init.mp4`;
+      const audInitName = slice_index !== undefined ? `audio_${aud.index}_init_part${slice_index}.mp4` : `audio_${aud.index}_init.mp4`;
       
-      const channels = aud.channels || 2;
-      const targetAudioBitrate = Math.min(768, Math.max(96, Math.round((channels / 2) * hls_audio_bitrate)));
-      const audFfmpegCmd = `ffmpeg -y -i "${INPUT_FILE}" -vn -map 0:${aud.index} -c:a aac -b:a ${targetAudioBitrate}k -f hls -hls_time 6 -hls_playlist_type vod -hls_segment_type fmp4 -hls_segment_filename "${audSegmentPattern}" -hls_fmp4_init_filename "${audInitName}" "${audPlaylistPath}"`;
+      let targetAudioBitrate;
+      if (aud.bitRate) {
+        const origAudioBitrateKbps = Math.round(aud.bitRate / 1000);
+        if (origAudioBitrateKbps <= hls_audio_bitrate) {
+          targetAudioBitrate = origAudioBitrateKbps;
+        } else {
+          targetAudioBitrate = Math.min(origAudioBitrateKbps, 320);
+        }
+      } else {
+        const channels = aud.channels || 2;
+        targetAudioBitrate = Math.min(320, Math.max(96, Math.round((channels / 2) * hls_audio_bitrate)));
+      }
+      let audFfmpegCmd = `ffmpeg -y `;
+      if (slice_start !== undefined) {
+        audFfmpegCmd += `-ss ${slice_start} `;
+      }
+      audFfmpegCmd += `-i "${INPUT_FILE}" `;
+      if (slice_duration !== undefined) {
+        audFfmpegCmd += `-t ${slice_duration} `;
+      }
+      audFfmpegCmd += `-vn -map 0:${aud.index} -c:a aac -b:a ${targetAudioBitrate}k -f hls -hls_time 6 -hls_playlist_type vod -hls_segment_type fmp4 -hls_segment_filename "${audSegmentPattern}" -hls_fmp4_init_filename "${audInitName}" `;
+      if (start_segment_number !== undefined) {
+        audFfmpegCmd += `-start_number ${start_segment_number} `;
+      }
+      audFfmpegCmd += `"${audPlaylistPath}"`;
       console.log(`Executing Audio FFmpeg command: ${audFfmpegCmd}`);
       
       try {
@@ -826,7 +981,7 @@ async function main() {
     const useCodecSuffix = resolvedCodecs.length > 1;
     const playlistName = useCodecSuffix ? `variant_${codec}.m3u8` : 'variant.m3u8';
     const segmentPattern = useCodecSuffix ? `seg_${codec}_%05d.m4s` : 'seg%05d.m4s';
-    const initName = useCodecSuffix ? `init_${codec}.mp4` : 'init.mp4';
+    const initName = useCodecSuffix ? (slice_index !== undefined ? `init_${codec}_part${slice_index}.mp4` : `init_${codec}.mp4`) : (slice_index !== undefined ? `init_part${slice_index}.mp4` : 'init.mp4');
 
     const playlistPath = path.join(OUTPUT_DIR, playlistName);
     const segmentPatternPath = path.join(OUTPUT_DIR, segmentPattern);
@@ -834,16 +989,27 @@ async function main() {
     const ffmpegArgs = [
       'ffmpeg',
       '-y',
-      '-i', `"${INPUT_FILE}"`,
+    ];
+    if (slice_start !== undefined) {
+      ffmpegArgs.push('-ss', String(slice_start));
+    }
+    ffmpegArgs.push('-i', `"${INPUT_FILE}"`);
+    if (slice_duration !== undefined) {
+      ffmpegArgs.push('-t', String(slice_duration));
+    }
+    ffmpegArgs.push(
       '-f', 'hls',
       '-hls_time', '6',
       '-hls_playlist_type', 'vod',
       '-hls_segment_type', 'fmp4',
       '-hls_segment_filename', `"${segmentPatternPath}"`,
       '-hls_fmp4_init_filename', `"${initName}"`,
-      '-hls_flags', 'independent_segments',
-      '-map', '0:v'
-    ];
+      '-hls_flags', 'independent_segments'
+    );
+    if (start_segment_number !== undefined) {
+      ffmpegArgs.push('-start_number', String(start_segment_number));
+    }
+    ffmpegArgs.push('-map', '0:v');
 
     let resolvedOutputWidth = inferredWidth;
     let resolvedOutputHeight = inferredHeight;
@@ -856,14 +1022,28 @@ async function main() {
       resolvedOutputHeight = Math.min(tHeight, inferredHeight);
       resolvedOutputWidth = Math.round((resolvedOutputHeight * inferredWidth) / inferredHeight / 2) * 2;
 
+      // Adjust parameters dynamically based on video profiles
+      const dynamicParams = adjustVideoParams(
+        label,
+        codec,
+        origBitrateKbps,
+        origHeight,
+        duration,
+        codec === 'av1' ? hls_av1_preset : hls_preset,
+        codec === 'av1' ? hls_av1_crf : hls_crf
+      );
+      console.log(`Dynamic params adjusted for ${codec}: CRF=${dynamicParams.crf}, Preset=${dynamicParams.preset}, Maxrate=${dynamicParams.maxrate || 'N/A'}, Bufsize=${dynamicParams.bufsize || 'N/A'}`);
+
       if (codec === 'h264') {
         ffmpegArgs.push(
           '-c:v', 'libx264',
-          '-preset', hls_preset,
-          '-crf', hls_crf
+          '-preset', dynamicParams.preset,
+          '-crf', dynamicParams.crf
         );
-        if (hls_maxrate) ffmpegArgs.push('-maxrate', hls_maxrate);
-        if (hls_bufsize) ffmpegArgs.push('-bufsize', hls_bufsize);
+        const activeMaxrate = dynamicParams.maxrate || hls_maxrate;
+        const activeBufsize = dynamicParams.bufsize || hls_bufsize;
+        if (activeMaxrate) ffmpegArgs.push('-maxrate', activeMaxrate);
+        if (activeBufsize) ffmpegArgs.push('-bufsize', activeBufsize);
         if (hls_profile) ffmpegArgs.push('-profile:v', hls_profile);
         if (hls_level) ffmpegArgs.push('-level', hls_level);
         ffmpegArgs.push(
@@ -885,12 +1065,18 @@ async function main() {
 
         ffmpegArgs.push(
           '-c:v', 'libsvtav1',
-          '-preset', hls_av1_preset,
-          '-crf', hls_av1_crf,
+          '-preset', dynamicParams.preset,
+          '-crf', dynamicParams.crf,
           '-svtav1-params', 'tune=0',
           '-pix_fmt', 'yuv420p',
           '-g', String(gop)
         );
+        if (dynamicParams.maxrate) {
+          ffmpegArgs.push('-maxrate', dynamicParams.maxrate);
+        }
+        if (dynamicParams.bufsize) {
+          ffmpegArgs.push('-bufsize', dynamicParams.bufsize);
+        }
         ffmpegArgs.push(
           '-vf', `"scale='trunc(oh*a/2)*2':'trunc(min(${tHeight},ih)/2)*2'"`
         );
@@ -956,7 +1142,7 @@ async function main() {
 
     const completedZipsForCodec = [];
     let currentZipSize = 0;
-    let currentZipIndex = 0;
+    let currentZipIndex = slice_index !== undefined ? slice_index : 0;
     let pendingFiles = [];
     let segmentStart = null;
     let segmentEnd = null;
@@ -1016,9 +1202,10 @@ async function main() {
     // Compute measuredBandwidth
     let measuredBandwidth = 0;
     const videoDuration = (probeData.format && probeData.format.duration) ? parseFloat(probeData.format.duration) : null;
-    if (videoDuration && videoDuration > 0) {
+    const durForBandwidth = slice_duration !== undefined ? slice_duration : videoDuration;
+    if (durForBandwidth && durForBandwidth > 0) {
       const totalBytes = filesToZip.reduce((acc, f) => acc + f.size, 0);
-      measuredBandwidth = Math.round((totalBytes * 8) / videoDuration);
+      measuredBandwidth = Math.round((totalBytes * 8) / durForBandwidth);
     }
 
     // Rewrite and Upload Manifests
@@ -1170,7 +1357,8 @@ async function main() {
     githubReleaseIds,
     subtitles: rewrittenSubtitlePlaylists,
     audios: audiosForCallback,
-    token: vps_callback_token
+    token: vps_callback_token,
+    ...(slice_index !== undefined ? { sliceIndex: slice_index, totalSlices: total_slices } : {})
   };
 
   await apiRequest(vps_callback_url, 'POST', {
