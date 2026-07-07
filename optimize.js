@@ -15,6 +15,59 @@ function getStreamTag(stream, tagName) {
   return undefined;
 }
 
+function parseFrameRate(rFrameRate) {
+  if (!rFrameRate) return 30;
+  const parts = rFrameRate.split('/');
+  if (parts.length === 2) {
+    const num = parseFloat(parts[0]);
+    const den = parseFloat(parts[1]);
+    if (den > 0) return num / den;
+  }
+  const val = parseFloat(rFrameRate);
+  return isNaN(val) ? 30 : val;
+}
+
+function getAV1ParamsForLabel(label) {
+  const normLabel = (label || '').toLowerCase();
+  const defaultPreset = process.env.HLS_AV1_PRESET || '8';
+  const defaultCrf = process.env.HLS_AV1_CRF || '30';
+
+  let preset = defaultPreset;
+  let crf = defaultCrf;
+
+  if (normLabel.includes('2160p')) {
+    preset = process.env.HLS_AV1_PRESET_2160P || '6';
+    crf = process.env.HLS_AV1_CRF_2160P || '32';
+  } else if (normLabel.includes('1440p')) {
+    preset = process.env.HLS_AV1_PRESET_1440P || '7';
+    crf = process.env.HLS_AV1_CRF_1440P || '31';
+  } else if (normLabel.includes('1080p')) {
+    preset = process.env.HLS_AV1_PRESET_1080P || '8';
+    crf = process.env.HLS_AV1_CRF_1080P || '30';
+  } else if (normLabel.includes('720p')) {
+    preset = process.env.HLS_AV1_PRESET_720P || '9';
+    crf = process.env.HLS_AV1_CRF_720P || '29';
+  } else if (normLabel.includes('480p')) {
+    preset = process.env.HLS_AV1_PRESET_480P || '10';
+    crf = process.env.HLS_AV1_CRF_480P || '28';
+  } else if (normLabel.includes('360p')) {
+    preset = process.env.HLS_AV1_PRESET_360P || '10';
+    crf = process.env.HLS_AV1_CRF_360P || '27';
+  }
+
+  return { preset, crf };
+}
+
+function checkSvtAv1() {
+  try {
+    execSync('ffmpeg -encoders | grep -i svtav1', { stdio: 'ignore' });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+
 // Config and constants
 const WORK_DIR = '/tmp/hls-worker';
 const INPUT_FILE = path.join(WORK_DIR, 'input.mp4');
@@ -420,7 +473,20 @@ async function main() {
   const extract_audio = (vps && vps.extract_audio !== undefined) ? !!vps.extract_audio : true;
   const subtitle_metadata = vps ? vps.subtitle_metadata : undefined;
 
-  console.log(`Starting HLS Optimization Job for file: ${file_id} (Release: ${release_id}, Label: ${label}, Kind: ${kind}, Preset: ${hls_preset}, CRF: ${hls_crf}, Maxrate: ${hls_maxrate}, Bufsize: ${hls_bufsize}, Audio Bitrate: ${hls_audio_bitrate}k, extract_subtitles=${extract_subtitles}, extract_audio=${extract_audio})`);
+  // Resolve Codecs list
+  let codecs = ['h264'];
+  if (vps && Array.isArray(vps.codecs)) {
+    codecs = vps.codecs;
+  } else if (process.env.HLS_CODECS) {
+    codecs = process.env.HLS_CODECS.split(',').map(c => c.trim()).filter(Boolean);
+  }
+
+  // Resolve AV1 settings
+  const av1ParamsFromEnv = getAV1ParamsForLabel(label);
+  const hls_av1_preset = (vps && vps.av1_preset !== undefined) ? String(vps.av1_preset) : av1ParamsFromEnv.preset;
+  const hls_av1_crf = (vps && vps.av1_crf !== undefined) ? String(vps.av1_crf) : av1ParamsFromEnv.crf;
+
+  console.log(`Starting HLS Optimization Job for file: ${file_id} (Release: ${release_id}, Label: ${label}, Kind: ${kind}, Codecs: [${codecs.join(', ')}], Preset: ${hls_preset}, CRF: ${hls_crf}, AV1 Preset: ${hls_av1_preset}, AV1 CRF: ${hls_av1_crf}, Maxrate: ${hls_maxrate}, Bufsize: ${hls_bufsize}, Audio Bitrate: ${hls_audio_bitrate}k, extract_subtitles=${extract_subtitles}, extract_audio=${extract_audio})`);
 
   // 1. Prepare directories
   fs.mkdirSync(WORK_DIR, { recursive: true });
@@ -585,53 +651,7 @@ async function main() {
     }
   });
 
-  // 6. Segment Video & Audio
-  console.log('Running FFmpeg segmenting on video...');
-  const playlistPath = path.join(OUTPUT_DIR, 'variant.m3u8');
-  const segmentPattern = path.join(OUTPUT_DIR, 'seg%05d.m4s');
-
-  const ffmpegArgs = [
-    'ffmpeg',
-    '-y',
-    '-i', `"${INPUT_FILE}"`,
-    '-f', 'hls',
-    '-hls_time', '6',
-    '-hls_playlist_type', 'vod',
-    '-hls_segment_type', 'fmp4',
-    '-hls_segment_filename', `"${segmentPattern}"`,
-    '-hls_fmp4_init_filename', 'init.mp4',
-    '-hls_flags', 'independent_segments',
-    '-map', '0:v'
-  ];
-
-  if (kind === 'original') {
-    ffmpegArgs.push('-c:v', 'copy');
-  } else {
-    // Compressed variant
-    const tHeight = target_height || 1080;
-    ffmpegArgs.push(
-      '-c:v', 'libx264',
-      '-preset', hls_preset,
-      '-crf', hls_crf
-    );
-    if (hls_maxrate) ffmpegArgs.push('-maxrate', hls_maxrate);
-    if (hls_bufsize) ffmpegArgs.push('-bufsize', hls_bufsize);
-    if (hls_profile) ffmpegArgs.push('-profile:v', hls_profile);
-    if (hls_level) ffmpegArgs.push('-level', hls_level);
-    ffmpegArgs.push(
-      '-vf', `"scale='trunc(oh*a/2)*2':'trunc(min(${tHeight},ih)/2)*2'"`,
-      '-force_key_frames', '"expr:gte(t,n_forced*6)"',
-      '-sc_threshold', '0',
-      '-flags', '+cgop'
-    );
-  }
-
-  ffmpegArgs.push(`"${playlistPath}"`);
-  const ffmpegCmd = ffmpegArgs.flat().join(' ');
-  console.log(`Executing FFmpeg command: ${ffmpegCmd}`);
-  execSync(ffmpegCmd, { stdio: 'inherit' });
-
-  // 7. Segment Subtitles (always process if present, for all variant kinds)
+  // 6. Segment Subtitles first (always process if present, for all variant kinds)
   const subtitlePlaylists = [];
   if (extract_subtitles && subtitleStreams.length > 0) {
     console.log(`Processing ${subtitleStreams.length} subtitle streams...`);
@@ -652,13 +672,14 @@ async function main() {
         if (fs.existsSync(fullVttPath)) {
           const fullContent = fs.readFileSync(fullVttPath, 'utf8');
           
-          let segmentDurations = [];
-          if (fs.existsSync(playlistPath)) {
-            const videoPlaylistText = fs.readFileSync(playlistPath, 'utf8');
-            segmentDurations = parseSegmentDurations(videoPlaylistText);
+          const segmentDurations = [];
+          const videoDurationVal = videoDuration || 0;
+          const fallbackTime = 6;
+          const fallbackNum = Math.ceil(videoDurationVal / fallbackTime);
+          for (let segIdx = 0; segIdx < fallbackNum; segIdx++) {
+            segmentDurations.push(segIdx === fallbackNum - 1 ? (videoDurationVal - segIdx * fallbackTime) : fallbackTime);
           }
           
-          // Step 2 & 3 & 4: Parse, clean, segment and generate playlist in JS
           const playlistText = segmentVtt(fullContent, segmentDurations, videoDuration, OUTPUT_DIR, sub.index);
           fs.writeFileSync(subPlaylistPath, playlistText);
           
@@ -669,12 +690,9 @@ async function main() {
             playlistText: playlistText
           });
           
-          // Cleanup full VTT so it isn't picked up by zip batching
           fs.unlinkSync(fullVttPath);
-          
           const segCount = fs.readdirSync(OUTPUT_DIR)
             .filter(name => name.startsWith(`subtitle_${sub.index}_`) && name.endsWith('.vtt')).length;
-          
           console.log(`Subtitle stream #${sub.index} converted successfully with ${segCount} segments`);
         } else {
           console.warn(`Warning: Extracted VTT file not found for stream #${sub.index}`);
@@ -688,7 +706,7 @@ async function main() {
     }
   }
 
-  // 7.5 Segment all audio tracks (always process if present, for all variant kinds)
+  // 7. Segment Audio next (always process if present, for all variant kinds)
   const audioPlaylists = [];
   if (extract_audio && audioStreams.length > 0) {
     console.log(`Processing audio tracks (found ${audioStreams.length} total)...`);
@@ -718,124 +736,303 @@ async function main() {
     }
   }
 
+  // 8. Run sequential codec segmentation jobs
+  const codecResults = [];
+  const skippedCodecs = [];
+
+  let resolvedCodecs = [];
+  if (kind === 'original') {
+    resolvedCodecs = [inferredCodec];
+  } else {
+    resolvedCodecs = codecs;
+  }
+
+  async function processCodecJob(codec) {
+    console.log(`Running FFmpeg segmenting on video for codec: ${codec}...`);
+    
+    if (codec === 'av1') {
+      const svtav1Available = checkSvtAv1();
+      if (!svtav1Available) {
+        console.log(`AV1 encoder (libsvtav1) not available in this ffmpeg build, skipping AV1 rendition`);
+        throw new Error('libsvtav1 encoder not available');
+      }
+    }
+
+    const useCodecSuffix = resolvedCodecs.length > 1;
+    const playlistName = useCodecSuffix ? `variant_${codec}.m3u8` : 'variant.m3u8';
+    const segmentPattern = useCodecSuffix ? `seg_${codec}_%05d.m4s` : 'seg%05d.m4s';
+    const initName = useCodecSuffix ? `init_${codec}.mp4` : 'init.mp4';
+
+    const playlistPath = path.join(OUTPUT_DIR, playlistName);
+    const segmentPatternPath = path.join(OUTPUT_DIR, segmentPattern);
+
+    const ffmpegArgs = [
+      'ffmpeg',
+      '-y',
+      '-i', `"${INPUT_FILE}"`,
+      '-f', 'hls',
+      '-hls_time', '6',
+      '-hls_playlist_type', 'vod',
+      '-hls_segment_type', 'fmp4',
+      '-hls_segment_filename', `"${segmentPatternPath}"`,
+      '-hls_fmp4_init_filename', `"${initName}"`,
+      '-hls_flags', 'independent_segments',
+      '-map', '0:v'
+    ];
+
+    let resolvedOutputWidth = inferredWidth;
+    let resolvedOutputHeight = inferredHeight;
+
+    if (kind === 'original') {
+      ffmpegArgs.push('-c:v', 'copy');
+    } else {
+      // Compressed variant
+      const tHeight = target_height || 1080;
+      resolvedOutputHeight = Math.min(tHeight, inferredHeight);
+      resolvedOutputWidth = Math.round((resolvedOutputHeight * inferredWidth) / inferredHeight / 2) * 2;
+
+      if (codec === 'h264') {
+        ffmpegArgs.push(
+          '-c:v', 'libx264',
+          '-preset', hls_preset,
+          '-crf', hls_crf
+        );
+        if (hls_maxrate) ffmpegArgs.push('-maxrate', hls_maxrate);
+        if (hls_bufsize) ffmpegArgs.push('-bufsize', hls_bufsize);
+        if (hls_profile) ffmpegArgs.push('-profile:v', hls_profile);
+        if (hls_level) ffmpegArgs.push('-level', hls_level);
+        ffmpegArgs.push(
+          '-vf', `"scale='trunc(oh*a/2)*2':'trunc(min(${tHeight},ih)/2)*2'"`,
+          '-force_key_frames', '"expr:gte(t,n_forced*6)"',
+          '-sc_threshold', '0',
+          '-flags', '+cgop'
+        );
+      } else if (codec === 'av1') {
+        let fps = 30; // default fallback
+        try {
+          if (videoStream && videoStream.r_frame_rate) {
+            fps = parseFrameRate(videoStream.r_frame_rate);
+          }
+        } catch (e) {
+          console.warn('Failed parsing r_frame_rate:', e);
+        }
+        const gop = Math.round(fps * 6);
+
+        ffmpegArgs.push(
+          '-c:v', 'libsvtav1',
+          '-preset', hls_av1_preset,
+          '-crf', hls_av1_crf,
+          '-svtav1-params', 'tune=0',
+          '-pix_fmt', 'yuv420p',
+          '-g', String(gop)
+        );
+        ffmpegArgs.push(
+          '-vf', `"scale='trunc(oh*a/2)*2':'trunc(min(${tHeight},ih)/2)*2'"`
+        );
+      } else {
+        throw new Error(`Unsupported codec: ${codec}`);
+      }
+    }
+
+    ffmpegArgs.push(`"${playlistPath}"`);
+    const ffmpegCmd = ffmpegArgs.flat().join(' ');
+    console.log(`Executing FFmpeg command: ${ffmpegCmd}`);
+    execSync(ffmpegCmd, { stdio: 'inherit' });
+
+    // Group segments and package ZIPs
+    console.log(`Grouping segments and packaging ZIPs for ${codec}...`);
+    const videoSegRegex = useCodecSuffix ? new RegExp(`^seg_${codec}_(\\d{5})\\.m4s$`) : /^seg(\d{5})\.m4s$/;
+    const videoInitRegex = useCodecSuffix ? new RegExp(`^init_${codec}\\.mp4$`) : /^init\.mp4$/;
+    const subtitleSegRegex = /^subtitle_\d+_(\d{5})\.vtt$/;
+    const audioSegRegex = /^audio_\d+_(\d{5})\.m4s$/;
+    const audioInitRegex = /^audio_\d+_init\.mp4$/;
+
+    const filesToZip = fs.readdirSync(OUTPUT_DIR)
+      .filter(name => {
+        if (videoSegRegex.test(name) || videoInitRegex.test(name)) return true;
+        if (subtitleSegRegex.test(name) || audioSegRegex.test(name) || audioInitRegex.test(name)) return true;
+        return false;
+      })
+      .map(name => {
+        const fullPath = path.join(OUTPUT_DIR, name);
+        const size = fs.statSync(fullPath).size;
+        
+        let segmentIndex = null;
+        const segMatch = name.match(videoSegRegex);
+        if (segMatch) {
+          segmentIndex = parseInt(segMatch[1], 10);
+        } else {
+          const subMatch = name.match(subtitleSegRegex);
+          if (subMatch) {
+            segmentIndex = parseInt(subMatch[1], 10);
+          } else {
+            const audMatch = name.match(audioSegRegex);
+            if (audMatch) {
+              segmentIndex = parseInt(audMatch[1], 10);
+            }
+          }
+        }
+        return { name, fullPath, size, segmentIndex };
+      });
+
+    filesToZip.sort((a, b) => {
+      const isInitA = a.name.includes('init');
+      const isInitB = b.name.includes('init');
+      if (isInitA && !isInitB) return -1;
+      if (!isInitA && isInitB) return 1;
+      
+      const idxA = a.segmentIndex !== null ? a.segmentIndex : -1;
+      const idxB = b.segmentIndex !== null ? b.segmentIndex : -1;
+      if (idxA !== idxB) {
+        return idxA - idxB;
+      }
+      return a.name.localeCompare(b.name);
+    });
+
+    const completedZipsForCodec = [];
+    let currentZipSize = 0;
+    let currentZipIndex = 0;
+    let pendingFiles = [];
+    let segmentStart = null;
+    let segmentEnd = null;
+
+    async function uploadZipBatch() {
+      if (pendingFiles.length === 0) return;
+      
+      const zipName = useCodecSuffix 
+        ? `segments-${label}-${codec}-part${currentZipIndex.toString().padStart(4, '0')}.zip`
+        : `segments-${label}-part${currentZipIndex.toString().padStart(4, '0')}.zip`;
+      const zipPath = path.join(WORK_DIR, zipName);
+      
+      console.log(`Packaging ZIP ${zipName} with ${pendingFiles.length} segments...`);
+      const fileArgs = pendingFiles.map(f => `"${f.fullPath}"`).join(' ');
+      execSync(`zip -0 -j "${zipPath}" ${fileArgs}`, { stdio: 'ignore' });
+      
+      const zipSize = fs.statSync(zipPath).size;
+      console.log(`Uploading ${zipName} (${(zipSize / 1024 / 1024).toFixed(1)} MB)...`);
+      const uploadRes = await uploadAssetWithRotation(zipName, zipPath, 'application/zip');
+      
+      completedZipsForCodec.push({
+        zipIndex: currentZipIndex,
+        assetId: uploadRes.id,
+        url: uploadRes.browser_download_url,
+        zipSize,
+        segmentStart,
+        segmentEnd
+      });
+      
+      fs.unlinkSync(zipPath);
+      for (const f of pendingFiles) {
+        try { fs.unlinkSync(f.fullPath); } catch (e) {}
+      }
+      
+      currentZipIndex++;
+      currentZipSize = 0;
+      pendingFiles = [];
+      segmentStart = null;
+      segmentEnd = null;
+    }
+
+    for (const file of filesToZip) {
+      if (file.segmentIndex !== null) {
+        if (segmentStart === null || file.segmentIndex < segmentStart) segmentStart = file.segmentIndex;
+        if (segmentEnd === null || file.segmentIndex > segmentEnd) segmentEnd = file.segmentIndex;
+      }
+      
+      pendingFiles.push(file);
+      currentZipSize += file.size;
+      
+      if (currentZipSize >= MAX_ZIP_BYTES) {
+        await uploadZipBatch();
+      }
+    }
+    await uploadZipBatch();
+
+    // Compute measuredBandwidth
+    let measuredBandwidth = 0;
+    const videoDuration = (probeData.format && probeData.format.duration) ? parseFloat(probeData.format.duration) : null;
+    if (videoDuration && videoDuration > 0) {
+      const totalBytes = filesToZip.reduce((acc, f) => acc + f.size, 0);
+      measuredBandwidth = Math.round((totalBytes * 8) / videoDuration);
+    }
+
+    // Rewrite and Upload Manifests
+    console.log(`Rewriting manifest for ${codec} to absolute paths...`);
+    const mainPlaylistText = fs.readFileSync(playlistPath, 'utf8');
+    const dbLabel = useCodecSuffix ? `${label}_${codec}` : label;
+    const rewrittenMainPlaylist = rewriteVariantPlaylist({
+      playlistText: mainPlaylistText,
+      fileId: file_id,
+      label: dbLabel
+    });
+
+    const playlistAssetName = useCodecSuffix ? `playlist_${codec}.m3u8` : 'playlist.m3u8';
+    const mainPlaylistTmpPath = path.join(WORK_DIR, playlistAssetName);
+    fs.writeFileSync(mainPlaylistTmpPath, rewrittenMainPlaylist);
+    console.log(`Uploading rewritten main HLS playlist as ${playlistAssetName}...`);
+    await uploadAssetWithRotation(playlistAssetName, mainPlaylistTmpPath, 'application/vnd.apple.mpegurl');
+    fs.unlinkSync(mainPlaylistTmpPath);
+
+    return {
+      codec,
+      outputWidth: resolvedOutputWidth,
+      outputHeight: resolvedOutputHeight,
+      measuredBandwidth,
+      rewrittenPlaylist: rewrittenMainPlaylist,
+      completedZips: completedZipsForCodec
+    };
+  }
+
+  for (const codec of resolvedCodecs) {
+    try {
+      const result = await processCodecJob(codec);
+      if (result) {
+        codecResults.push(result);
+      }
+    } catch (err) {
+      console.warn(`Warning: Failed to process job for codec ${codec}:`, err);
+      skippedCodecs.push({ codec, reason: err.message || 'Unknown error' });
+    }
+  }
+
+  // Fallback to H.264 if no renditions succeeded
+  if (codecResults.length === 0) {
+    console.log('No codecs were successfully processed. Attempting H.264 fallback...');
+    try {
+      const result = await processCodecJob('h264');
+      if (result) {
+        codecResults.push(result);
+        const index = skippedCodecs.findIndex(s => s.codec === 'h264');
+        if (index !== -1) {
+          skippedCodecs.splice(index, 1);
+        }
+      }
+    } catch (err) {
+      console.error('Fatal Error: Fallback to H.264 also failed:', err);
+      skippedCodecs.push({ codec: 'h264', reason: err.message || 'Unknown error during fallback' });
+    }
+  }
+
+  if (codecResults.length === 0) {
+    console.error('Fatal Error: No codecs could be processed and H.264 fallback failed.');
+    process.exit(1);
+  }
+
   // Delete input file to release space
   fs.unlinkSync(INPUT_FILE);
 
-  // 8. ZIP segments in batches (up to 1GB limit)
-  console.log('Grouping segments and packaging ZIPs...');
-  const allOutputFiles = fs.readdirSync(OUTPUT_DIR)
-    .filter(name => name.endsWith('.m4s') || name.endsWith('.vtt') || name.endsWith('.mp4'))
-    .map(name => {
-      const fullPath = path.join(OUTPUT_DIR, name);
-      const size = fs.statSync(fullPath).size;
-      
-      let segmentIndex = null;
-      const segMatch = name.match(/seg(\d{5})\.m4s/);
-      if (segMatch) {
-        segmentIndex = parseInt(segMatch[1], 10);
-      } else {
-        const subMatch = name.match(/subtitle_\d+_(\d{5})\.vtt/);
-        if (subMatch) {
-          segmentIndex = parseInt(subMatch[1], 10);
-        } else {
-          const audMatch = name.match(/audio_\d+_(\d{5})\.m4s/);
-          if (audMatch) {
-            segmentIndex = parseInt(audMatch[1], 10);
-          }
-        }
-      }
-      return { name, fullPath, size, segmentIndex };
-    });
-
-  allOutputFiles.sort((a, b) => {
-    const isInitA = a.name.includes('init');
-    const isInitB = b.name.includes('init');
-    if (isInitA && !isInitB) return -1;
-    if (!isInitA && isInitB) return 1;
-    
-    const idxA = a.segmentIndex !== null ? a.segmentIndex : -1;
-    const idxB = b.segmentIndex !== null ? b.segmentIndex : -1;
-    if (idxA !== idxB) {
-      return idxA - idxB;
-    }
-    
-    return a.name.localeCompare(b.name);
-  });
-
-  const completedZips = [];
-  let currentZipSize = 0;
-  let currentZipIndex = 0;
-  let pendingFiles = [];
-  let segmentStart = null;
-  let segmentEnd = null;
-
-  async function uploadZipBatch() {
-    if (pendingFiles.length === 0) return;
-    
-    const zipName = `segments-${label}-part${currentZipIndex.toString().padStart(4, '0')}.zip`;
-    const zipPath = path.join(WORK_DIR, zipName);
-    
-    console.log(`Packaging ZIP ${zipName} with ${pendingFiles.length} segments...`);
-    const fileArgs = pendingFiles.map(f => `"${f.fullPath}"`).join(' ');
-    // Use system zip utility with compression level 0 (store only) for maximum speed
-    execSync(`zip -0 -j "${zipPath}" ${fileArgs}`, { stdio: 'ignore' });
-    
-    const zipSize = fs.statSync(zipPath).size;
-    console.log(`Uploading ${zipName} (${(zipSize / 1024 / 1024).toFixed(1)} MB)...`);
-    const uploadRes = await uploadAssetWithRotation(zipName, zipPath, 'application/zip');
-    
-    completedZips.push({
-      zipIndex: currentZipIndex,
-      assetId: uploadRes.id,
-      url: uploadRes.browser_download_url,
-      zipSize,
-      segmentStart,
-      segmentEnd
-    });
-    
-    fs.unlinkSync(zipPath);
-    // Cleanup the uploaded segment files to keep disk usage low
-    for (const f of pendingFiles) {
-      try { fs.unlinkSync(f.fullPath); } catch (e) {}
-    }
-    
-    currentZipIndex++;
-    currentZipSize = 0;
-    pendingFiles = [];
-    segmentStart = null;
-    segmentEnd = null;
-  }
-
-  for (const file of allOutputFiles) {
-    if (file.segmentIndex !== null) {
-      if (segmentStart === null || file.segmentIndex < segmentStart) segmentStart = file.segmentIndex;
-      if (segmentEnd === null || file.segmentIndex > segmentEnd) segmentEnd = file.segmentIndex;
-    }
-    
-    pendingFiles.push(file);
-    currentZipSize += file.size;
-    
-    if (currentZipSize >= MAX_ZIP_BYTES) {
-      await uploadZipBatch();
-    }
-  }
-  await uploadZipBatch();
-
-  // 9. Rewrite and Upload Manifests
-  console.log('Rewriting manifests to absolute paths...');
-  const mainPlaylistText = fs.readFileSync(playlistPath, 'utf8');
-  const rewrittenMainPlaylist = rewriteVariantPlaylist({
-    playlistText: mainPlaylistText,
-    fileId: file_id,
-    label
-  });
+  // 9. Rewrite and Upload subtitle/audio manifests
+  console.log('Rewriting and uploading subtitle/audio manifests to absolute paths...');
+  const firstSuccess = codecResults[0];
+  const useCodecSuffix = resolvedCodecs.length > 1;
+  const activeLabel = useCodecSuffix ? `${label}_${firstSuccess.codec}` : label;
 
   const rewrittenSubtitlePlaylists = [];
   for (const subPlaylist of subtitlePlaylists) {
     const rewrittenText = rewriteVariantPlaylist({
       playlistText: subPlaylist.playlistText,
       fileId: file_id,
-      label
+      label: activeLabel
     });
     
     const subFileName = `subtitle_${subPlaylist.streamIndex}.m3u8`;
@@ -859,7 +1056,7 @@ async function main() {
     const rewrittenText = rewriteVariantPlaylist({
       playlistText: audPlaylist.playlistText,
       fileId: file_id,
-      label
+      label: activeLabel
     });
     
     const audFileName = `audio_${audPlaylist.streamIndex}.m3u8`;
@@ -878,20 +1075,9 @@ async function main() {
     });
   }
 
-  const mainPlaylistTmpPath = path.join(WORK_DIR, 'playlist.m3u8');
-  fs.writeFileSync(mainPlaylistTmpPath, rewrittenMainPlaylist);
-  console.log('Uploading rewritten main HLS playlist...');
-  await uploadAssetWithRotation('playlist.m3u8', mainPlaylistTmpPath, 'application/vnd.apple.mpegurl');
-  fs.unlinkSync(mainPlaylistTmpPath);
-
   // 10. Callback to VPS to notify completeness
   console.log(`Sending success callback to VPS at: ${vps_callback_url}`);
 
-  // Build audio metadata for the master playlist. Every variant reports all audio
-  // streams (so the backend can mark the default in the master regardless of which
-  // variant finishes last). Since we are doing demuxed audio, all audio tracks (including
-  // the default one) are uploaded as separate audio playlist assets (audio_<index>.m3u8)
-  // and have their own URIs in the master playlist.
   const audiosForCallback = audioStreams.map((aud, i) => ({
     streamIndex: aud.index,
     language: aud.language,
@@ -899,20 +1085,24 @@ async function main() {
     isDefault: i === 0
   }));
 
+  const renditionsForCallback = codecResults.map(r => ({
+    codec: r.codec,
+    width: r.outputWidth,
+    height: r.outputHeight,
+    measuredBandwidth: r.measuredBandwidth,
+    playlistText: r.rewrittenPlaylist,
+    completedZips: r.completedZips
+  }));
+
   const callbackBody = {
     fileId: file_id,
     userId: user_id,
     label,
     kind,
-    width: outputWidth,
-    height: outputHeight,
-    codec: inferredCodec,
+    renditions: renditionsForCallback,
+    skippedCodecs,
     githubReleaseId: release_id,
     githubReleaseIds,
-    playlistText: rewrittenMainPlaylist,
-    completedZips,
-    // All variants upload subtitle/audio playlist assets (shared across variants via mainLabel in master).
-    // Backend dedupes by streamIndex when building the master playlist.
     subtitles: rewrittenSubtitlePlaylists,
     audios: audiosForCallback,
     token: vps_callback_token
