@@ -170,50 +170,115 @@ function downloadAsset(urlStr, token, destPath) {
   });
 }
 
-// Upload a single file as a release asset
+// Upload a single file as a release asset (with retries on transient connection issues)
 async function uploadAssetFile(uploadUrl, assetName, filePath, contentType, token) {
   const stat = fs.statSync(filePath);
   const baseUploadUrl = uploadUrl.split('{')[0];
   const uploadEndpoint = `${baseUploadUrl}?name=${encodeURIComponent(assetName)}`;
   const url = new URL(uploadEndpoint);
   
-  return new Promise((resolve, reject) => {
-    const options = {
-      method: 'POST',
-      hostname: url.hostname,
-      port: url.port || 443,
-      path: url.pathname + url.search,
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'User-Agent': 'github-storage-worker/1.0.0',
-        'Content-Type': contentType,
-        'Content-Length': stat.size.toString(),
-        'Accept': 'application/vnd.github+json',
-      },
-    };
-    
-    const req = https.request(options, (res) => {
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => {
-        const buffer = Buffer.concat(chunks);
-        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-          resolve(JSON.parse(buffer.toString('utf8')));
-        } else {
-          reject(new Error(`Failed to upload asset ${assetName}, status ${res.statusCode}: ${buffer.toString('utf8')}`));
-        }
+  // Parse owner, repo, and release ID from upload URL for potential deletion on retry
+  let apiOwner = '';
+  let apiRepo = '';
+  let apiReleaseId = '';
+  const match = baseUploadUrl.match(/\/repos\/([^\/]+)\/([^\/]+)\/releases\/(\d+)\/assets/);
+  if (match) {
+    apiOwner = match[1];
+    apiRepo = match[2];
+    apiReleaseId = match[3];
+  }
+
+  const maxAttempts = 3;
+  let attempt = 0;
+
+  while (true) {
+    attempt++;
+    try {
+      const timeoutMs = Math.max(
+        15 * 60 * 1000, // 15 minutes minimum
+        2 * 60 * 1000 * Math.ceil(stat.size / (100 * 1024 * 1024)) // 2 minutes per 100MB
+      );
+      return await new Promise((resolve, reject) => {
+        const options = {
+          method: 'POST',
+          hostname: url.hostname,
+          port: url.port || 443,
+          path: url.pathname + url.search,
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'User-Agent': 'github-storage-worker/1.0.0',
+            'Content-Type': contentType,
+            'Content-Length': stat.size.toString(),
+            'Accept': 'application/vnd.github+json',
+          },
+          timeout: timeoutMs,
+        };
+        
+        const req = https.request(options, (res) => {
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () => {
+            const buffer = Buffer.concat(chunks);
+            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+              resolve(JSON.parse(buffer.toString('utf8')));
+            } else {
+              reject(new Error(`Status ${res.statusCode}: ${buffer.toString('utf8')}`));
+            }
+          });
+        });
+        
+        req.on('error', reject);
+        req.on('timeout', () => {
+          req.destroy(new Error('Upload request timed out'));
+        });
+        
+        const fileStream = fs.createReadStream(filePath);
+        fileStream.pipe(req);
+        fileStream.on('error', (err) => {
+          req.destroy();
+          reject(err);
+        });
       });
-    });
-    
-    req.on('error', reject);
-    
-    const fileStream = fs.createReadStream(filePath);
-    fileStream.pipe(req);
-    fileStream.on('error', (err) => {
-      req.destroy();
-      reject(err);
-    });
-  });
+    } catch (err) {
+      console.warn(`Attempt ${attempt} to upload ${assetName} failed: ${err.message}`);
+      if (attempt >= maxAttempts) {
+        throw err;
+      }
+
+      // Check if duplicate asset needs to be deleted before retry (especially on 422 already_exists)
+      if (apiOwner && apiRepo && apiReleaseId) {
+        console.log(`Checking for existing asset ${assetName} to clean up...`);
+        try {
+          const listUrl = `https://api.github.com/repos/${apiOwner}/${apiRepo}/releases/${apiReleaseId}/assets`;
+          const res = await apiRequest(listUrl, 'GET', {
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/vnd.github+json',
+            'User-Agent': 'github-storage-worker/1.0.0',
+          });
+          const assets = JSON.parse(res.body.toString('utf8'));
+          if (Array.isArray(assets)) {
+            const existingAsset = assets.find(a => a.name === assetName);
+            if (existingAsset) {
+              console.log(`Found existing asset ${assetName} (ID: ${existingAsset.id}). Deleting to allow clean retry...`);
+              const deleteUrl = `https://api.github.com/repos/${apiOwner}/${apiRepo}/releases/assets/${existingAsset.id}`;
+              await apiRequest(deleteUrl, 'DELETE', {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/vnd.github+json',
+                'User-Agent': 'github-storage-worker/1.0.0',
+              });
+              console.log(`Successfully deleted duplicate asset ${assetName}`);
+            }
+          }
+        } catch (cleanErr) {
+          console.warn(`Warning: Failed to delete duplicate asset before retry: ${cleanErr.message}`);
+        }
+      }
+
+      const backoffMs = attempt * 2000;
+      console.log(`Retrying in ${backoffMs}ms...`);
+      await new Promise(r => setTimeout(r, backoffMs));
+    }
+  }
 }
 
 // Rewrite HLS manifest references to target the VPS virtual endpoints
